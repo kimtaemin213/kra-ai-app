@@ -46,12 +46,6 @@ def fetch_api_dataframe(url, params):
 
 
 def generate_actual_race_dates(meet_code):
-    """
-    경마장별 주요 개최 요일 (목/금/토/일 전체 반영)
-    - 서울(1): 목, 금, 토, 일
-    - 부경(2): 목, 금, 토, 일
-    - 제주(3): 목, 금, 토, 일 (목요 제주 경마 포함)
-    """
     days_map = {
         "1": [3, 4, 5, 6],  # 목(3), 금(4), 토(5), 일(6)
         "2": [3, 4, 5, 6],
@@ -210,7 +204,7 @@ def predict_pure_probabilities(df_raw, df_track, selected_race):
 
 
 # ==========================================
-# 3. 실시간 UI 구성
+# 3. 실시간 UI 구성 (실제 경주 번호 동적 추출)
 # ==========================================
 st.title("🏇 KRA AI 경마 예측 시스템")
 st.caption("실제 경주 일정 자동 동기화 대시보드")
@@ -236,9 +230,22 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
         )
 
     with col2:
-        # 경마장별 경주 수 제어 (제주: 8경주 / 서울,부경: 11경주)
-        max_races = 8 if meet_choice == "3" else 11
-        race_options = list(range(1, max_races + 1))
+        # 💡 해당 날짜의 전체 출전표 데이터를 가져와 실제 존재하는 경주 번호(rcNo) 목록만 자동 추출
+        df_check, _, _ = collect_kra_data(meet_choice, target_date_str)
+
+        if not df_check.empty and "rcNo" in df_check.columns:
+            # API 데이터에서 실제 존재하는 경주 번호 추출 및 정렬 (예: 1~8 또는 1~11)
+            actual_races = sorted(
+                pd.to_numeric(df_check["rcNo"], errors="coerce")
+                .dropna()
+                .unique()
+                .astype(int)
+                .tolist()
+            )
+            race_options = actual_races if actual_races else list(range(1, 12))
+        else:
+            # API 키 동기화 전이거나 데이터가 없는 날짜일 경우 기본 범위 설정
+            race_options = list(range(1, 12))
 
         selected_race = st.selectbox(
             "🏁 경주 번호 (RACE)", options=race_options, index=0
