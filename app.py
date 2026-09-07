@@ -27,7 +27,7 @@ DECODING_KEY = "h7qTh7gmeKJ49Z3vL/4Oss49MVNvYWqGYyDyJgk8cUGs99uBTP1Qit3jk0qs8UVk
 
 
 # ==========================================
-# 1. API 데이터 수집 및 실제 경주일자 생성
+# 1. API 데이터 수집 모듈
 # ==========================================
 def fetch_api_dataframe(url, params):
     try:
@@ -45,23 +45,42 @@ def fetch_api_dataframe(url, params):
     return pd.DataFrame()
 
 
-def generate_actual_race_dates(meet_code):
-    days_map = {
-        "1": [3, 4, 5, 6],  # 목(3), 금(4), 토(5), 일(6)
-        "2": [3, 4, 5, 6],
-        "3": [3, 4, 5, 6],
-    }
-    target_days = days_map.get(meet_code, [3, 4, 5, 6])
-
+def generate_all_possible_dates():
+    """최근 14일 전부터 향후 30일까지의 목/금/토/일 날짜 생성"""
     today = datetime.date.today()
     race_dates = []
-
-    for i in range(-14, 60):
+    for i in range(-14, 30):
         d = today - datetime.timedelta(days=i)
-        if d.weekday() in target_days:
+        if d.weekday() in [3, 4, 5, 6]:  # 목, 금, 토, 일
             race_dates.append(d.strftime("%Y%m%d"))
-
     return sorted(race_dates, reverse=True)
+
+
+@st.cache_data(ttl=180)
+def get_active_meets_for_date(target_date):
+    """선택한 날짜에 실제 경주 데이터가 있는 경마장 코드만 추출"""
+    active_meets = []
+    meet_names = {"1": "서울 렛츠런파크", "2": "부산경남", "3": "제주"}
+
+    for meet_code in ["1", "2", "3"]:
+        params = {
+            "serviceKey": DECODING_KEY,
+            "pageNo": "1",
+            "numOfRows": "5",
+            "meet": meet_code,
+            "rc_date": target_date,
+        }
+        df = fetch_api_dataframe(
+            "http://apis.data.go.kr/B551015/API21_1/raceHorseList_1", params
+        )
+        if not df.empty:
+            active_meets.append(meet_code)
+
+    # API 미동기화 또는 데이터 조회 불가 시 기본 전체 제공
+    if not active_meets:
+        return ["1", "2", "3"]
+
+    return active_meets
 
 
 @st.cache_data(ttl=180)
@@ -204,17 +223,28 @@ def predict_pure_probabilities(df_raw, df_track, selected_race):
 
 
 # ==========================================
-# 3. 실시간 UI 구성 (실제 경주 번호 동적 추출)
+# 3. 실시간 UI 구성 (날짜 선선택 구조)
 # ==========================================
 st.title("🏇 KRA AI 경마 예측 시스템")
 st.caption("실제 경주 일정 자동 동기화 대시보드")
 
-with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표시)", expanded=True):
+with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
     col1, col2 = st.columns(2)
+
     with col1:
+        # 1) 날짜를 먼저 선택
+        all_dates = generate_all_possible_dates()
+        target_date_str = st.selectbox(
+            "📅 경기 날짜 선택",
+            options=all_dates,
+            format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
+        )
+
+        # 2) 선택한 날짜에 경기가 있는 경마장만 동적 추출
+        active_meets = get_active_meets_for_date(target_date_str)
         meet_choice = st.selectbox(
-            "경마장 선택",
-            options=["1", "2", "3"],
+            "🏟️ 경마장 선택 (해당일 개최지)",
+            options=active_meets,
             format_func=lambda x: {
                 "1": "서울 렛츠런파크",
                 "2": "부산경남",
@@ -222,19 +252,11 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
             }[x],
         )
 
-        valid_dates = generate_actual_race_dates(meet_choice)
-        target_date_str = st.selectbox(
-            "📅 실제 경기 날짜 선택",
-            options=valid_dates,
-            format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
-        )
-
     with col2:
-        # 💡 해당 날짜의 전체 출전표 데이터를 가져와 실제 존재하는 경주 번호(rcNo) 목록만 자동 추출
+        # 3) 선택한 날짜/경마장의 실제 출전 경주 번호만 동적 추출
         df_check, _, _ = collect_kra_data(meet_choice, target_date_str)
 
         if not df_check.empty and "rcNo" in df_check.columns:
-            # API 데이터에서 실제 존재하는 경주 번호 추출 및 정렬 (예: 1~8 또는 1~11)
             actual_races = sorted(
                 pd.to_numeric(df_check["rcNo"], errors="coerce")
                 .dropna()
@@ -244,7 +266,6 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
             )
             race_options = actual_races if actual_races else list(range(1, 12))
         else:
-            # API 키 동기화 전이거나 데이터가 없는 날짜일 경우 기본 범위 설정
             race_options = list(range(1, 12))
 
         selected_race = st.selectbox(
