@@ -1,4 +1,3 @@
-
 import xml.etree.ElementTree as ET
 import datetime
 import numpy as np
@@ -48,7 +47,7 @@ def fetch_api_dataframe(url, params):
 
 def generate_actual_race_dates(meet_code):
     """
-    경마장별 주요 개최 요일 (특별/변동 경기 고려하여 목/금/토/일 전체 반영)
+    경마장별 주요 개최 요일 (목/금/토/일 전체 반영)
     - 서울(1): 목, 금, 토, 일
     - 부경(2): 목, 금, 토, 일
     - 제주(3): 목, 금, 토, 일 (목요 제주 경마 포함)
@@ -56,14 +55,13 @@ def generate_actual_race_dates(meet_code):
     days_map = {
         "1": [3, 4, 5, 6],  # 목(3), 금(4), 토(5), 일(6)
         "2": [3, 4, 5, 6],
-        "3": [3, 4, 5, 6],  # 목요일(3) 포함
+        "3": [3, 4, 5, 6],
     }
     target_days = days_map.get(meet_code, [3, 4, 5, 6])
 
     today = datetime.date.today()
     race_dates = []
 
-    # 과거 60일부터 향후 14일까지 선택 범위 확장
     for i in range(-14, 60):
         d = today - datetime.timedelta(days=i)
         if d.weekday() in target_days:
@@ -237,8 +235,8 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
             format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
         )
 
-   with col2:
-        # 경마장별 실제 최대 경주 수 제한 (서울: 11경주, 부경: 11경주, 제주: 8경주)
+    with col2:
+        # 경마장별 경주 수 제어 (제주: 8경주 / 서울,부경: 11경주)
         max_races = 8 if meet_choice == "3" else 11
         race_options = list(range(1, max_races + 1))
 
@@ -248,6 +246,7 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
         total_budget = st.number_input(
             "💵 베팅 예산 (원)", min_value=10000, value=100000, step=10000
         )
+
 run_button = st.button("🚀 실시간 API 승률 분석")
 
 if run_button:
