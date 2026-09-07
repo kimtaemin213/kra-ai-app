@@ -237,14 +237,17 @@ with st.expander("⚙️ 경주 일정 및 설정 (실제 경기 날짜만 표�
             format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
         )
 
-    with col2:
+   with col2:
+        # 경마장별 실제 최대 경주 수 제한 (서울: 11경주, 부경: 11경주, 제주: 8경주)
+        max_races = 8 if meet_choice == "3" else 11
+        race_options = list(range(1, max_races + 1))
+
         selected_race = st.selectbox(
-            "🏁 경주 번호 (RACE)", options=list(range(1, 12)), index=7
+            "🏁 경주 번호 (RACE)", options=race_options, index=0
         )
         total_budget = st.number_input(
             "💵 베팅 예산 (원)", min_value=10000, value=100000, step=10000
         )
-
 run_button = st.button("🚀 실시간 API 승률 분석")
 
 if run_button:
