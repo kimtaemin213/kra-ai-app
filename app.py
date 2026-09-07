@@ -20,6 +20,9 @@ st.markdown(
     .main { padding: 0.8rem; }
     .stButton>button { width: 100%; border-radius: 10px; font-weight: bold; background-color: #0284c7; color: white; height: 3.2em; }
     .metric-card { background-color: #1e293b; padding: 15px; border-radius: 12px; color: white; margin-bottom: 12px; }
+    .badge-high { background-color: #15803d; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .badge-med { background-color: #b45309; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .badge-low { background-color: #b91c1c; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
     </style>
 """,
     unsafe_allow_html=True,
@@ -48,19 +51,17 @@ def fetch_api_dataframe(url, params):
 
 
 def generate_all_possible_dates():
-    """최근 14일 전부터 향후 30일까지의 개최 가능 요일(목/금/토/일) 날짜 생성"""
     today = datetime.date.today()
     race_dates = []
     for i in range(-14, 30):
         d = today - datetime.timedelta(days=i)
-        if d.weekday() in [3, 4, 5, 6]:  # 목, 금, 토, 일
+        if d.weekday() in [3, 4, 5, 6]:
             race_dates.append(d.strftime("%Y%m%d"))
     return sorted(race_dates, reverse=True)
 
 
 @st.cache_data(ttl=180)
 def get_active_meets_for_date(target_date):
-    """선택한 날짜에 실제 경주 데이터가 존재하는 경마장 코드만 동적 추출"""
     active_meets = []
     for meet_code in ["1", "2", "3"]:
         params = {
@@ -159,7 +160,7 @@ def collect_kra_data(meet_code, target_date):
 
 
 # ==========================================
-# 2. 최적화 가중치 기반 AI ENGINE
+# 2. AI 승률 연산 & 경주 신뢰도(Confidence) 계산 ENGINE
 # ==========================================
 def predict_pure_probabilities(df_raw, df_track, selected_race):
     X = df_raw.copy()
@@ -172,47 +173,60 @@ def predict_pure_probabilities(df_raw, df_track, selected_race):
             track_moisture = float(target_track.iloc[0].get("humidity", 5.0))
             track_state_str = target_track.iloc[0].get("trackCondition", "양호")
 
-    # [백테스트 최적화 모델 수식 결합]
-    # 최적 가중치: 기수(1.18), 경주마(1.22), 1착횟수(0.75), 레이팅(1.05), 배당기대(0.92), 부담중량(-0.55), 체중변동(-0.18), 습도보너스
     humidity_bonus = 0.12 if track_moisture >= 10.0 else 0.0
-    market_expectation = (10.0 / X["winOdds"].clip(lower=1.1)).clip(upper=8.0)
 
     X["score_base"] = (
         (X["jkWinRt"] / 25.0) * 1.18
         + (X["hrWinRt"] / 30.0) * 1.22
         + (X["ord1Cnt"] / 8.0) * 0.75
         + (X["rating"] / 100.0) * 1.05
-        + (market_expectation / 8.0) * 0.92
         - (X["handyCap"] / 60.0) * 0.55
         - (X["chgWeight"].abs() / 10.0) * 0.18
         + humidity_bonus
     )
 
-    # Softmax 정규화
+    # Softmax 승률 계산
     exp_scores = np.exp(X["score_base"] - X["score_base"].max())
     sum_exp = exp_scores.sum()
     X["AI_승률(%)"] = ((exp_scores / sum_exp) * 100).round(1)
     X["AI_예측순위"] = X["AI_승률(%)"].rank(ascending=False, method="min")
+    
+    # EV 계산 (시장 배당률과의 분리)
     X["EV_기대값"] = ((X["AI_승률(%)"] / 100.0) * X["winOdds"]) - 1.0
 
-    return (
-        X.sort_values(by="AI_예측순위").reset_index(drop=True),
-        track_moisture,
-        track_state_str,
-    )
+    sorted_df = X.sort_values(by="AI_예측순위").reset_index(drop=True)
+    
+    # 경주 신뢰도 (Top1 - Top2 Gap) 계산
+    top1_p = sorted_df.iloc[0]["AI_승률(%)"]
+    top2_p = sorted_df.iloc[1]["AI_승률(%)"] if len(sorted_df) > 1 else 0
+    confidence_gap = top1_p - top2_p
+
+    if confidence_gap >= 15.0:
+        conf_status = "🔥 HIGH CONFIDENCE (명확한 축마)"
+        conf_badge = "badge-high"
+        recommend_action = "BET"
+    elif confidence_gap >= 8.0:
+        conf_status = "🟡 MEDIUM (경합 경주)"
+        conf_badge = "badge-med"
+        recommend_action = "BET"
+    else:
+        conf_status = "🔴 LOW CONFIDENCE (혼전 경주 - PASS 권장)"
+        conf_badge = "badge-low"
+        recommend_action = "PASS"
+
+    return sorted_df, track_moisture, track_state_str, conf_status, conf_badge, recommend_action, confidence_gap
 
 
 # ==========================================
-# 3. 실시간 UI 구성 (날짜/경마장/경주 동적 선택)
+# 3. 실시간 UI 구성
 # ==========================================
 st.title("🏇 KRA AI 경마 예측 시스템")
-st.caption("Out-of-Sample 가중치 최적화 엔진 적용 대시보드")
+st.caption("Walk-forward 기반 신뢰도 분석 & Dynamic Betting 대시보드")
 
 with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
     col1, col2 = st.columns(2)
 
     with col1:
-        # 1) 날짜 선택
         all_dates = generate_all_possible_dates()
         target_date_str = st.selectbox(
             "📅 경기 날짜 선택",
@@ -220,7 +234,6 @@ with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
             format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
         )
 
-        # 2) 개최 경마장만 동적 표시
         active_meets = get_active_meets_for_date(target_date_str)
         meet_choice = st.selectbox(
             "🏟️ 경마장 선택 (해당일 개최지)",
@@ -233,7 +246,6 @@ with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
         )
 
     with col2:
-        # 3) 당일 실제 편성 경주 수만 동적 추출
         df_check, _, _ = collect_kra_data(meet_choice, target_date_str)
 
         if not df_check.empty and "rcNo" in df_check.columns:
@@ -252,7 +264,7 @@ with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
             "🏁 경주 번호 (RACE)", options=race_options, index=0
         )
         total_budget = st.number_input(
-            "💵 베팅 예산 (원)", min_value=10000, value=100000, step=10000
+            "💵 기본 단위 예산 (원)", min_value=10000, value=100000, step=10000
         )
 
 run_button = st.button("🚀 실시간 API 승률 분석")
@@ -281,7 +293,7 @@ if run_button:
                     f"⚠️ {target_date_str} 날짜에는 {selected_race}경주의 출전 정보가 없습니다."
                 )
             else:
-                race_data, moisture, track_state = predict_pure_probabilities(
+                race_data, moisture, track_state, conf_status, conf_badge, rec_action, gap = predict_pure_probabilities(
                     df_target_race, df_track, selected_race
                 )
 
@@ -309,16 +321,16 @@ if run_button:
                 else:
                     race_data["실제 착순"] = np.nan
 
-                race_data = race_data.sort_values(by="AI_예측순위").reset_index(drop=True)
-
                 st.success(
                     f"🟢 [{target_date_str}] {meet_choice}번 경마장 {selected_race}경주 API 수신 완료"
                 )
+                
+                # 경주 불확실성/신뢰도 카드
                 st.markdown(
                     f"""
                 <div class="metric-card">
-                    <h4>💧 당일 함수율: {moisture}% | ☀️ 주로상태: {track_state}</h4>
-                    <p>분석 대상: <b>{selected_race}경주</b> | 설정 예산: <b>{total_budget:,}원</b></p>
+                    <h4>💧 함수율: {moisture}% | ☀️ 주로상태: {track_state}</h4>
+                    <p><b>경주 불확실성 평가:</b> <span class="{conf_badge}">{conf_status}</span> (1-2위 승률 차이: {gap:.1f}%)</p>
                 </div>
                 """,
                     unsafe_allow_html=True,
@@ -371,28 +383,35 @@ if run_button:
 
                 st.dataframe(display_df, use_container_width=True)
 
-                # 퀀트 EV 포트폴리오
-                st.subheader("💰 AI 추천 실전 베팅 포트폴리오")
-                top1 = race_data.iloc[0]
-                top2 = race_data.iloc[1]
-                st.warning(
-                    f"🎯 **[복승식 메인 (50%)]**: {int(top1['chulNo'])}번({top1['hrName']}) - {int(top2['chulNo'])}번({top2['hrName']}) | 추천액: **{int(total_budget*0.5):,}원**"
-                )
-
-                if len(race_data) >= 4:
-                    sub1, sub2 = race_data.iloc[2], race_data.iloc[3]
-                    st.info(
-                        f"🛡️ **[삼복승식 서브 (30%)]**: {int(top1['chulNo'])} - {int(top2['chulNo'])} - {int(sub1['chulNo'])} / {int(sub2['chulNo'])} | 추천액: **{int(total_budget*0.3):,}원**"
-                    )
-
-                best_ev_row = race_data.sort_values(
-                    by="EV_기대값", ascending=False
-                ).iloc[0]
-                if best_ev_row["EV_기대값"] > 0.05:
-                    st.success(
-                        f"🔥 **[단승식 가치베팅 (20%)]**: {int(best_ev_row['chulNo'])}번({best_ev_row['hrName']}) | 기대수익률: +{best_ev_row['EV_기대값']*100:.1f}% | 추천액: **{int(total_budget*0.2):,}원**"
-                    )
+                # Dynamic Betting 전략 제시
+                st.subheader("💰 AI 추천 Dynamic 베팅 포트폴리오")
+                if rec_action == "PASS":
+                    st.error("🚨 **[AI 경고]**: 이번 경주는 출전마 간 승률 차이가 적은 **고위험 혼전 경주**입니다. **[PASS (관망)]**를 강력 추천합니다.")
                 else:
-                    st.info(
-                        f"🔒 **[단승식 안전방어 (20%)]**: {int(top1['chulNo'])}번({top1['hrName']}) | 추천액: **{int(total_budget*0.2):,}원**"
+                    # Dynamic 비중 조절
+                    dynamic_scale = min(1.5, max(0.8, 1.0 + (gap / 100.0)))
+                    recommended_bet = int(total_budget * dynamic_scale)
+                    
+                    top1 = race_data.iloc[0]
+                    top2 = race_data.iloc[1]
+                    st.warning(
+                        f"🎯 **[복승식 메인 (50%)]**: {int(top1['chulNo'])}번({top1['hrName']}) - {int(top2['chulNo'])}번({top2['hrName']}) | 동적 추천액: **{int(recommended_bet*0.5):,}원**"
                     )
+
+                    if len(race_data) >= 4:
+                        sub1, sub2 = race_data.iloc[2], race_data.iloc[3]
+                        st.info(
+                            f"🛡️ **[삼복승식 서브 (30%)]**: {int(top1['chulNo'])} - {int(top2['chulNo'])} - {int(sub1['chulNo'])} / {int(sub2['chulNo'])} | 동적 추천액: **{int(recommended_bet*0.3):,}원**"
+                        )
+
+                    best_ev_row = race_data.sort_values(
+                        by="EV_기대값", ascending=False
+                    ).iloc[0]
+                    if best_ev_row["EV_기대값"] > 0.05:
+                        st.success(
+                            f"🔥 **[단승식 가치베팅 (20%)]**: {int(best_ev_row['chulNo'])}번({best_ev_row['hrName']}) | 기대수익률: +{best_ev_row['EV_기대값']*100:.1f}% | 동적 추천액: **{int(recommended_bet*0.2):,}원**"
+                        )
+                    else:
+                        st.info(
+                            f"🔒 **[단승식 안전방어 (20%)]**: {int(top1['chulNo'])}번({top1['hrName']}) | 동적 추천액: **{int(recommended_bet*0.2):,}원**"
+                        )
