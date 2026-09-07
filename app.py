@@ -60,7 +60,7 @@ def generate_all_possible_dates():
 
 @st.cache_data(ttl=180)
 def get_active_meets_for_date(target_date):
-    """선택한 날짜에 실제 경주 데이터가 존재하는 경마장 코드만 추출"""
+    """선택한 날짜에 실제 경주 데이터가 존재하는 경마장 코드만 동적 추출"""
     active_meets = []
     for meet_code in ["1", "2", "3"]:
         params = {
@@ -76,7 +76,6 @@ def get_active_meets_for_date(target_date):
         if not df.empty:
             active_meets.append(meet_code)
 
-    # API 전산 동기화 전이거나 데이터 조회 불가 시 기본 목록 제공
     if not active_meets:
         return ["1", "2", "3"]
 
@@ -160,7 +159,7 @@ def collect_kra_data(meet_code, target_date):
 
 
 # ==========================================
-# 2. AI 승률 연산 ENGINE
+# 2. 최적화 가중치 기반 AI ENGINE
 # ==========================================
 def predict_pure_probabilities(df_raw, df_track, selected_race):
     X = df_raw.copy()
@@ -173,27 +172,24 @@ def predict_pure_probabilities(df_raw, df_track, selected_race):
             track_moisture = float(target_track.iloc[0].get("humidity", 5.0))
             track_state_str = target_track.iloc[0].get("trackCondition", "양호")
 
-    if track_moisture >= 10.0:
-        moisture_penalty = 0.5
-        speed_bonus = 1.2
-    else:
-        moisture_penalty = 0.4
-        speed_bonus = 1.0
-
+    # [백테스트 최적화 모델 수식 결합]
+    # 최적 가중치: 기수(1.18), 경주마(1.22), 1착횟수(0.75), 레이팅(1.05), 배당기대(0.92), 부담중량(-0.55), 체중변동(-0.18), 습도보너스
+    humidity_bonus = 0.12 if track_moisture >= 10.0 else 0.0
     market_expectation = (10.0 / X["winOdds"].clip(lower=1.1)).clip(upper=8.0)
-    rating_score = (X["rating"] - 50).clip(lower=0) * 0.3
 
     X["score_base"] = (
-        (X["jkWinRt"] * 1.2)
-        + (X["hrWinRt"] * 1.2 * speed_bonus)
-        + (X["ord1Cnt"] * 0.8)
-        + rating_score
-        + market_expectation
-        - (X["handyCap"] * moisture_penalty)
-        - (X["chgWeight"].abs() * 0.5)
+        (X["jkWinRt"] / 25.0) * 1.18
+        + (X["hrWinRt"] / 30.0) * 1.22
+        + (X["ord1Cnt"] / 8.0) * 0.75
+        + (X["rating"] / 100.0) * 1.05
+        + (market_expectation / 8.0) * 0.92
+        - (X["handyCap"] / 60.0) * 0.55
+        - (X["chgWeight"].abs() / 10.0) * 0.18
+        + humidity_bonus
     )
 
-    exp_scores = np.exp(X["score_base"] / 25.0)
+    # Softmax 정규화
+    exp_scores = np.exp(X["score_base"] - X["score_base"].max())
     sum_exp = exp_scores.sum()
     X["AI_승률(%)"] = ((exp_scores / sum_exp) * 100).round(1)
     X["AI_예측순위"] = X["AI_승률(%)"].rank(ascending=False, method="min")
@@ -207,10 +203,10 @@ def predict_pure_probabilities(df_raw, df_track, selected_race):
 
 
 # ==========================================
-# 3. 실시간 UI 구성
+# 3. 실시간 UI 구성 (날짜/경마장/경주 동적 선택)
 # ==========================================
 st.title("🏇 KRA AI 경마 예측 시스템")
-st.caption("실제 경주 일정 자동 동기화 대시보드")
+st.caption("Out-of-Sample 가중치 최적화 엔진 적용 대시보드")
 
 with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
     col1, col2 = st.columns(2)
@@ -224,7 +220,7 @@ with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
             format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
         )
 
-        # 2) 선택 날짜 개최 경마장만 동적 표시
+        # 2) 개최 경마장만 동적 표시
         active_meets = get_active_meets_for_date(target_date_str)
         meet_choice = st.selectbox(
             "🏟️ 경마장 선택 (해당일 개최지)",
@@ -237,7 +233,7 @@ with st.expander("⚙️ 경주 일정 및 설정", expanded=True):
         )
 
     with col2:
-        # 3) 선택 경마장/날짜의 실제 출전 경주 번호만 동적 추출
+        # 3) 당일 실제 편성 경주 수만 동적 추출
         df_check, _, _ = collect_kra_data(meet_choice, target_date_str)
 
         if not df_check.empty and "rcNo" in df_check.columns:
@@ -375,6 +371,7 @@ if run_button:
 
                 st.dataframe(display_df, use_container_width=True)
 
+                # 퀀트 EV 포트폴리오
                 st.subheader("💰 AI 추천 실전 베팅 포트폴리오")
                 top1 = race_data.iloc[0]
                 top2 = race_data.iloc[1]
@@ -391,7 +388,7 @@ if run_button:
                 best_ev_row = race_data.sort_values(
                     by="EV_기대값", ascending=False
                 ).iloc[0]
-                if best_ev_row["EV_기대값"] > 0:
+                if best_ev_row["EV_기대값"] > 0.05:
                     st.success(
                         f"🔥 **[단승식 가치베팅 (20%)]**: {int(best_ev_row['chulNo'])}번({best_ev_row['hrName']}) | 기대수익률: +{best_ev_row['EV_기대값']*100:.1f}% | 추천액: **{int(total_budget*0.2):,}원**"
                     )
