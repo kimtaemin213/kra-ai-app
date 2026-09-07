@@ -1,4 +1,4 @@
-%%writefile app.py
+
 import xml.etree.ElementTree as ET
 import datetime
 import numpy as np
