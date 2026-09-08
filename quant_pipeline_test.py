@@ -1,103 +1,215 @@
-import warnings
-import datetime
+import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
+import requests
 
-warnings.filterwarnings("ignore")
 
-# ==========================================
-# 8. 수학적으로 완벽히 공정한 Synthetic Market 생성기
-# ==========================================
-def generate_fair_synthetic_races(n_races=3000, margin=0.27):
-    np.random.seed(2026)
-    start_date = datetime.date(2024, 1, 1)
-    takeout_rate = 1.0 - margin  # 정확히 0.73 (환급률 73%)
+class KRADataPipeline:
 
-    races = []
-    current_date = start_date
+  def __init__(self, service_key):
+    self.service_key = service_key
+    self.endpoints = {
+        "entry_sheet": "https://apis.data.go.kr/B551015/API26_2/entrySheet_2",
+        "track_info": "https://apis.data.go.kr/B551015/API189_1/Track_1",
+    }
 
-    for r_idx in range(1, n_races + 1):
-        if r_idx % 8 == 0:
-            current_date += datetime.timedelta(days=1)
+  def fetch_raw_api(self, url, params):
+    """API 수신 및 XML 파싱 함수"""
+    full_params = {
+        "ServiceKey": self.service_key,
+        "serviceKey": self.service_key,
+        "pageNo": "1",
+        "numOfRows": "100",
+        "_type": "xml",
+        **params,
+    }
+    try:
+      res = requests.get(url, params=full_params, timeout=8)
+      if res.status_code != 200:
+        return None, f"HTTP {res.status_code} Error"
 
-        n_horses = np.random.choice([8, 10, 12, 14], p=[0.2, 0.4, 0.3, 0.1])
-        
-        # Dirichlet 분포로 합계가 정확히 1.0이 되는 승률 생성 (스케일 왜곡 방지)
-        true_prob = np.random.dirichlet(np.ones(n_horses) * 2.0)
+      root = ET.fromstring(res.content)
+      err_msg = root.findtext(".//errMsg") or root.findtext(".//returnAuthMsg")
+      if err_msg:
+        return None, f"게이트웨이 에러: {err_msg}"
 
-        # 승자 결정
-        winner_idx = np.random.choice(n_horses, p=true_prob)
-        finish_rank = np.ones(n_horses, dtype=int) * 2
-        finish_rank[winner_idx] = 1
+      res_code = root.findtext(".//resultCode")
+      if res_code in ["00", "0", "NORMAL_SERVICE", "OK"]:
+        items = root.findall(".//item")
+        if items:
+          return (
+              pd.DataFrame([
+                  {child.tag: child.text for child in item} for item in items
+              ]),
+              None,
+          )
+        return pd.DataFrame(), "조회된 데이터가 없습니다."
+      return None, f"서비스 에러 [{res_code}]"
+    except Exception as e:
+      return None, f"통신 장애: {str(e)}"
 
-        # 이론적 공정 배당 (Clip 없이 정직하게 적용)
-        win_odds = takeout_rate / true_prob
+  def process_pipeline(
+      self, meet_code, target_date, selected_race, daily_spent
+  ):
+    """실시간 수신 -> 정제 -> 퀀트연산 -> UI 가공 일괄 처리 파이프라인"""
+    DAILY_LIMIT = 30000
+    rem_budget = max(0, DAILY_LIMIT - daily_spent)
 
-        for h_idx in range(n_horses):
-            races.append({
-                "race_id": f"R{r_idx:05d}",
-                "rc_date": current_date,
-                "chulNo": h_idx + 1,
-                "hrName": f"마필_{h_idx+1:02d}",
-                "true_prob": true_prob[h_idx],
-                "winOdds": win_odds[h_idx],
-                "finish": finish_rank[h_idx]
-            })
+    # 1. 출전표 및 주로정보 실시간 수신
+    df_entry, err = self.fetch_raw_api(
+        self.endpoints["entry_sheet"],
+        {"meet": meet_code, "rc_date": target_date},
+    )
+    df_track, _ = self.fetch_raw_api(
+        self.endpoints["track_info"],
+        {
+            "meet": meet_code,
+            "rc_date_fr": target_date,
+            "rc_date_to": target_date,
+        },
+    )
 
-    df = pd.DataFrame(races)
-    df["rc_date"] = pd.to_datetime(df["rc_date"])
-    return df
+    if err or df_entry is None or df_entry.empty:
+      return None, err or "데이터 없음", None
 
-# ==========================================
-# SANITY CHECK EXECUTION ENGINE
-# ==========================================
-def run_all_sanity_checks():
-    print("=" * 90)
-    print("🧪 퀀트 시뮬레이터 공정성 & 회계 정산 SANITY CHECK (10,000회 검증)")
-    print("=" * 90)
-
-    df = generate_fair_synthetic_races(n_races=3000)
-    STAKE = 10000
-
-    # TEST 1: Random Betting Monte Carlo
-    print(f"\n[TEST 1] Random 선택 Monte Carlo Simulation (1,000회 반복)...")
-    random_rois = []
-    for _ in range(1000):
-        random_picks = df.groupby("race_id").sample(n=1)
-        tot_stake = len(random_picks) * STAKE
-        hits = random_picks[random_picks["finish"] == 1]
-        payout = (hits["winOdds"] * STAKE).sum()
-        roi = ((payout - tot_stake) / tot_stake) * 100
-        random_rois.append(roi)
-
-    random_rois = np.array(random_rois)
-    avg_roi = np.mean(random_rois)
-    print(f"  • 평균 ROI : {avg_roi:+.2f}% (기대값: -27.00%)")
-
-    # TEST 4: Finish Order Permutation (가중 무작위 셔플)
-    print(f"\n[TEST 4] Finish Order Permutation (가중 무작위 셔플) 검사...")
-    permuted_df = df.copy()
-    
-    def weighted_shuffle_race(group):
-        group['finish'] = 2
-        probs = group['true_prob'].values
-        winner_pos = np.random.choice(len(group), p=probs)
-        group.iloc[winner_pos, group.columns.get_loc('finish')] = 1
-        return group
-
-    permuted_df = permuted_df.groupby('race_id', group_keys=False).apply(weighted_shuffle_race)
-    
-    perm_picks = permuted_df.groupby("race_id").sample(n=1)
-    tot_stk = len(perm_picks) * STAKE
-    hits = perm_picks[perm_picks["finish"] == 1]
-    pay = (hits["winOdds"] * STAKE).sum()
-    perm_roi = ((pay - tot_stk) / tot_stk) * 100
-    
-    print(f"  • Permutation 후 Random ROI: {perm_roi:+.2f}%")
-    if -32.0 <= perm_roi <= -22.0:
-        print("  🟢 Pass: 수식 완전 정상화! 결과 셔플 시 -27% 부근 손실이 정확히 산출됩니다.")
+    # 2. Target 경주 번호(rcNo) 필터링
+    if "rcNo" in df_entry.columns:
+      df_race = df_entry[
+          df_entry["rcNo"].astype(str) == str(selected_race)
+      ].copy()
     else:
-        print(f"  🔴 Fail: 결과 수치({perm_roi:.2f}%) 재검증 필요.")
+      df_race = df_entry.copy()
 
-if __name__ == "__main__":
-    run_all_sanity_checks()
+    if df_race.empty:
+      return None, f"{selected_race}경주 출전 데이터가 없습니다.", None
+
+    # 3. 수치형 데이터 전처리
+    num_cols = ["winOdds", "jkWinRt", "hrWinRt", "rating", "handyCap", "chulNo"]
+    for col in num_cols:
+      if col in df_race.columns:
+        df_race[col] = (
+            pd.to_numeric(
+                df_race[col].astype(str).str.replace("%", ""), errors="coerce"
+            )
+            .fillna(0.0)
+        )
+      else:
+        df_race[col] = 5.0 if col == "winOdds" else 10.0
+
+    # 4. 주로 상태 (함수율) 파싱
+    water_percent = 4.0
+    if (
+        df_track is not None
+        and not df_track.empty
+        and "waterPercent" in df_track.columns
+    ):
+      try:
+        water_percent = float(df_track.iloc[0].get("waterPercent", 4.0))
+      except ValueError:
+        water_percent = 4.0
+
+    # 5. Softmax AI 승률 및 EV 기대값 연산
+    humidity_bonus = 0.15 if water_percent >= 10.0 else 0.0
+    df_race["score"] = (
+        (df_race["jkWinRt"] / 25.0) * 1.20
+        + (df_race["hrWinRt"] / 30.0) * 1.30
+        + (df_race["rating"] / 100.0) * 1.05
+        - (df_race["handyCap"] / 60.0) * 0.50
+        + humidity_bonus
+    )
+
+    exp_s = np.exp(df_race["score"] - df_race["score"].max())
+    df_race["AI_승률(%)"] = ((exp_s / exp_s.sum()) * 100).round(1)
+    df_race["market_raw"] = 1.0 / np.maximum(df_race["winOdds"], 1.05)
+    df_race["시장_승률(%)"] = (
+        (df_race["market_raw"] / df_race["market_raw"].sum()) * 100
+    ).round(1)
+
+    df_race["AI_EDGE(%p)"] = (
+        df_race["AI_승률(%)"] - df_race["시장_승률(%)"]
+    ).round(1)
+    df_race["EV_기대값"] = (
+        (df_race["AI_승률(%)"] / 100.0) * df_race["winOdds"]
+    ) - 1.0
+    df_race["AI_예측순위"] = (
+        df_race["AI_승률(%)"].rank(ascending=False, method="min").astype(int)
+    )
+
+    # 6. 의사결정 및 자금 차감 검사
+    sorted_df = df_race.sort_values(by="AI_예측순위").reset_index(drop=True)
+    top1 = sorted_df.iloc[0]
+    top2 = sorted_df.iloc[1] if len(sorted_df) > 1 else top1
+    gap = top1["AI_승률(%)"] - top2["AI_승률(%)"]
+    ev = top1["EV_기대값"]
+
+    if ev >= 0.40 and gap >= 10.0:
+      raw_grade, target_stake = "🔥 S급", 5000
+    elif ev >= 0.20 and gap >= 6.0:
+      raw_grade, target_stake = "🔷 A급", 3000
+    elif ev >= 0.08 and gap >= 4.0:
+      raw_grade, target_stake = "📙 B급", 2000
+    else:
+      raw_grade, target_stake = "🔴 C/D급", 0
+
+    if target_stake == 0:
+      final_grade, badge_cls, actual_stake, action = (
+          "🔴 PASS (조건 미달)",
+          "badge-pass",
+          0,
+          "PASS",
+      )
+    elif rem_budget < target_stake:
+      final_grade, badge_cls, actual_stake, action = (
+          (
+              f"🔒 PASS (예산 부족: 남은 예산 {rem_budget:,}원 < 필요금액"
+              f" {target_stake:,}원)"
+          ),
+          "badge-pass",
+          0,
+          "PASS",
+      )
+    else:
+      final_grade = f"{raw_grade} (추천)"
+      badge_cls = (
+          "badge-s"
+          if "S급" in raw_grade
+          else ("badge-a" if "A급" in raw_grade else "badge-b")
+      )
+      actual_stake, action = target_stake, "BET"
+
+    # 7. UI 전용 필수 컬럼 슬라이싱 & 가공
+    display_map = {
+        "AI_예측순위": "순위",
+        "chulNo": "마번",
+        "hrName": "마명",
+        "jkName": "기수",
+        "trName": "조교사",
+        "handyCap": "부담중량",
+        "winOdds": "단승배당",
+        "AI_승률(%)": "AI 승률",
+        "시장_승률(%)": "시장 승률",
+        "AI_EDGE(%p)": "EDGE(%p)",
+        "EV_기대값": "EV 기대값",
+    }
+
+    valid_cols = [c for c in display_map.keys() if c in sorted_df.columns]
+    ui_df = sorted_df[valid_cols].rename(columns=display_map)
+
+    ui_df["EV 기대값"] = (ui_df["EV 기대값"] * 100).round(1).astype(str) + "%"
+    ui_df["AI 승률"] = ui_df["AI 승률"].astype(str) + "%"
+    ui_df["시장 승률"] = ui_df["시장 승률"].astype(str) + "%"
+
+    summary_info = {
+        "water_pct": water_percent,
+        "grade": final_grade,
+        "badge_cls": badge_cls,
+        "actual_stake": actual_stake,
+        "action": action,
+        "gap": gap,
+        "rem_budget": rem_budget,
+        "top1_no": top1.get("chulNo", ""),
+        "top1_name": top1.get("hrName", ""),
+        "top1_ev": top1.get("EV_기대값", 0.0),
+    }
+
+    return ui_df, None, summary_info
