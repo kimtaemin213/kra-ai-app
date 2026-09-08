@@ -35,7 +35,8 @@ class KRAFeatureEngineV2:
         **params,
     }
     try:
-      res = requests.get(url, params=full_params, timeout=6)
+      # timeout을 4초로 단축하여 무한 멈춤 방지
+      res = requests.get(url, params=full_params, timeout=4)
       if res.status_code != 200:
         return None, f"HTTP {res.status_code}"
 
@@ -57,7 +58,7 @@ class KRAFeatureEngineV2:
         return pd.DataFrame(), "데이터 없음"
       return None, f"서비스 에러 [{res_code}]"
     except Exception as e:
-      return None, f"통신 장애: {str(e)}"
+      return None, f"통신 장애/초과: {str(e)}"
 
   @staticmethod
   def bayesian_smoothed_win_rate(
@@ -82,6 +83,9 @@ class KRAFeatureEngineV2:
 
   @staticmethod
   def calculate_race_difficulty(probs: np.ndarray) -> tuple:
+    if len(probs) == 0:
+      return "🔴 데이터 없음", False, 0.0, 0.0, 1.0
+
     probs = np.clip(probs, 1e-12, 1.0)
     probs = probs / probs.sum()
 
@@ -118,7 +122,7 @@ class KRAFeatureEngineV2:
         {"meet": meet_code, "rc_date": target_date},
     )
     if err or df_entry is None or df_entry.empty:
-      return None, err or "출전표 데이터 없음", None
+      return None, None, err or "출전표 데이터 없음"
 
     if "rcNo" in df_entry.columns:
       df = df_entry[df_entry["rcNo"].astype(str) == str(selected_race)].copy()
@@ -126,7 +130,7 @@ class KRAFeatureEngineV2:
       df = df_entry.copy()
 
     if df.empty:
-      return None, f"{selected_race}경주 데이터를 찾을 수 없습니다.", None
+      return None, None, f"{selected_race}경주 데이터를 찾을 수 없습니다."
 
     df_track, _ = self.fetch_raw_api(
         self.endpoints["track_info"],
@@ -267,12 +271,12 @@ class KRAFeatureEngineV2:
 
     metrics_summary = {
         "difficulty_grade": grade,
-        "bet_recommend": bet_rec,
-        "top1_prob": round(top1_p * 100, 1),
-        "gap_p": round(gap * 100, 1),
-        "normalized_entropy": round(entropy, 3),
-        "water_percent": water_percent,
-        "total_horses": len(sorted_df),
+        "bet_recommend": bool(bet_rec),
+        "top1_prob": float(round(top1_p * 100, 1)),
+        "gap_p": float(round(gap * 100, 1)),
+        "normalized_entropy": float(round(entropy, 3)),
+        "water_percent": float(water_percent),
+        "total_horses": int(len(sorted_df)),
     }
 
     return sorted_df, metrics_summary, None
