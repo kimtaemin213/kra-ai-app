@@ -1,25 +1,41 @@
 import pandas as pd
 import streamlit as st
 
+
+def attach_rank_medals(rank_series):
+  """순위(1, 2, 3 등)에 맞춰 정확히 🥇🥈🥉 이모지를 붙여주는 함수"""
+  result = []
+  for r in rank_series:
+    if r == 1:
+      result.append(f"🥇 {r}")
+    elif r == 2:
+      result.append(f"🥈 {r}")
+    elif r == 3:
+      result.append(f"🥉 {r}")
+    else:
+      result.append(f"{r}")
+  return result
+
+
+def attach_val_medals(df, val_col):
+  """지표 값(승률, 레이팅 등)이 높은 순서대로 1, 2, 3위에게 메달을 붙여주는 함수"""
+  ranks = df[val_col].rank(ascending=False, method="min")
+  result = []
+  for val, rank in zip(df[val_col], ranks):
+    if rank == 1:
+      result.append(f"🥇 {val}")
+    elif rank == 2:
+      result.append(f"🥈 {val}")
+    elif rank == 3:
+      result.append(f"🥉 {val}")
+    else:
+      result.append(f"{val}")
+  return result
+
+
 st.set_page_config(
     page_title="KRA AI Quant Betting Console V2", page_icon="🏇", layout="wide"
 )
-
-
-def attach_medal_labels(df, val_col):
-  ranks = df[val_col].rank(ascending=False, method="min")
-  formatted_list = []
-  for val, rank in zip(df[val_col], ranks):
-    if rank == 1:
-      formatted_list.append(f"🥇 {val}")
-    elif rank == 2:
-      formatted_list.append(f"🥈 {val}")
-    elif rank == 3:
-      formatted_list.append(f"🥉 {val}")
-    else:
-      formatted_list.append(f"{val}")
-  return formatted_list
-
 
 st.markdown(
     """
@@ -166,15 +182,15 @@ if st.button("🚀 V2 AI 퀀트 분석 및 시각화 리포트 생성"):
     ).round(1)
     sorted_df["jk_score_pct"] = (sorted_df["feat_jk_score"] * 100).round(1)
 
+    # 💡 [핵심 수정]: 순위와 수치 지표 메달 부착 정정
+    ai_rank_medals = attach_rank_medals(sorted_df["AI_예측순위"])
     hr_win_medals = [
-        f"{val}%"
-        for val in attach_medal_labels(sorted_df, "smoothed_win_pct")
+        f"{val}%" for val in attach_val_medals(sorted_df, "smoothed_win_pct")
     ]
     jk_win_medals = [
-        f"{val}%" for val in attach_medal_labels(sorted_df, "jk_score_pct")
+        f"{val}%" for val in attach_val_medals(sorted_df, "jk_score_pct")
     ]
-    rating_medals = attach_medal_labels(sorted_df, "rating_num")
-    ai_rank_medals = attach_medal_labels(sorted_df, "AI_예측순위")
+    rating_medals = attach_val_medals(sorted_df, "rating_num")
 
     display_df = pd.DataFrame({
         "AI 순위": ai_rank_medals,
