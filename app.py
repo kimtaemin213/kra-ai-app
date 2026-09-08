@@ -145,7 +145,7 @@ class KRADataPipeline:
               )
           )
 
-    # 주로 정보 추출
+    # 주로 정보
     water_percent = 4.0
     track_state = "양호"
     if df_track is not None and not df_track.empty:
@@ -157,23 +157,22 @@ class KRADataPipeline:
       if "trackState" in df_track.columns:
         track_state = str(df_track.iloc[0].get("trackState", "양호"))
 
-    # 4. 연산 및 데이터 프레임 바인딩
-    scores, jk_win_list, hr_win_list = [], [], []
+    # 4. 연산 및 데이터 바인딩
+    scores, jk_win_list, hr_win_list, rating_list = [], [], [], []
     for idx, row in df_race.iterrows():
-      # 기수 1년 승률
       jk_name = str(row.get("jkName", ""))
       jk_win_rt = jockey_win_map.get(jk_name, 0.0)
       jk_win_list.append(jk_win_rt)
 
-      # 마필 1년 승률
       ord1_cnt_y = pd.to_numeric(row.get("ord1CntY", 0), errors="coerce") or 0.0
       rc_cnt_y = pd.to_numeric(row.get("rcCntY", 1), errors="coerce") or 1.0
       hr_win_rt = (ord1_cnt_y / max(rc_cnt_y, 1.0)) * 100.0
       hr_win_list.append(round(hr_win_rt, 1))
 
-      # 레이팅 & 부담중량
       rating = pd.to_numeric(row.get("rating", 0), errors="coerce") or 0.0
+      rating_list.append(rating)
       rating_score = (rating / 120.0) * 100.0
+
       handy_cap = (
           pd.to_numeric(
               row.get("wgBudam", row.get("handyCap", 0)), errors="coerce"
@@ -182,7 +181,6 @@ class KRADataPipeline:
       )
       handy_score = (handy_cap / 60.0) * 100.0
 
-      # 체중 패널티
       chul_no = str(row.get("chulNo", ""))
       wg_diff = weight_diff_map.get(chul_no, 0.0)
       weight_penalty = -0.3 if abs(wg_diff) >= 10.0 else 0.0
@@ -203,8 +201,9 @@ class KRADataPipeline:
       scores.append(total_score)
 
     df_race["raw_score"] = scores
-    df_race["기수_1년승률(%)"] = jk_win_list
-    df_race["마필_1년승률(%)"] = hr_win_list
+    df_race["기수_1년승률_val"] = jk_win_list
+    df_race["마필_1년승률_val"] = hr_win_list
+    df_race["레이팅_val"] = rating_list
 
     exp_s = np.exp(df_race["raw_score"] - df_race["raw_score"].max())
     df_race["AI_승률_val"] = ((exp_s / exp_s.sum()) * 100).round(1)
@@ -226,7 +225,6 @@ class KRADataPipeline:
         df_race["winOdds_val"] = odds_vals
 
     if has_real_odds:
-      df_race["market_raw"] = 1.0 / np.maximum(df_race["winOdds_val"], 1.05)
       df_race["EV_기대값"] = (
           (df_race["AI_승률_val"] / 100.0) * df_race["winOdds_val"]
       ) - 1.0
@@ -253,8 +251,24 @@ class KRADataPipeline:
 
 
 # ==========================================
-# 2. UI 레이아웃 리뉴얼
+# 2. UI 및 금/은/동 이모지 생성 함수
 # ==========================================
+def attach_medal_labels(df, val_col):
+  """해당 컬럼의 1, 2, 3등에게 금은동 이모지를 부여하는 함수"""
+  ranks = df[val_col].rank(ascending=False, method="min")
+  formatted_list = []
+  for val, rank in zip(df[val_col], ranks):
+    if rank == 1:
+      formatted_list.append(f"🥇 {val}")
+    elif rank == 2:
+      formatted_list.append(f"🥈 {val}")
+    elif rank == 3:
+      formatted_list.append(f"🥉 {val}")
+    else:
+      formatted_list.append(f"{val}")
+  return formatted_list
+
+
 st.set_page_config(
     page_title="KRA AI Quant Betting Console", page_icon="🏇", layout="wide"
 )
@@ -321,7 +335,6 @@ if st.button("🚀 AI 퀀트 분석 및 시각화 리포트 생성"):
   if err:
     st.error(f"데이터 파이프라인 처리 오류: {err}")
   else:
-    # 당일 주로 정보 헤더 카드 표출 (API189_1)
     st.info(
         f"🌧️ **당일 주로 상태**: {summary['track_state']} | 💧 **주로 함수율**: {summary['water_pct']}%"
     )
@@ -380,22 +393,29 @@ if st.button("🚀 AI 퀀트 분석 및 시각화 리포트 생성"):
     # 섹션 2: 📊 출전마 AI 순수 승률 & 통합 퀀트 분석표
     st.subheader("📊 출전마 AI 순수 승률 & 통합 퀀트 분석표")
 
-    # 8개 API 수신/연산 데이터 종합 컬럼 가공
+    # 각 주요 지표별 🥇 🥈 🥉 금은동 메달 부착
+    rating_medals = attach_medal_labels(sorted_df, "레이팅_val")
+    jk_win_medals = [
+        f"{val}%"
+        for val in attach_medal_labels(sorted_df, "기수_1년승률_val")
+    ]
+    hr_win_medals = [
+        f"{val}%"
+        for val in attach_medal_labels(sorted_df, "마필_1년승률_val")
+    ]
+    ai_rank_medals = attach_medal_labels(sorted_df, "AI_예측순위")
+
     display_df = pd.DataFrame({
-        "AI순위": sorted_df["AI_예측순위"],
+        "AI순위": ai_rank_medals,
         "게이트": sorted_df["chulNo"],
         "마명": sorted_df["hrName"],
         "기수명": sorted_df["jkName"],
         "부담중량": sorted_df.get(
             "wgBudam", sorted_df.get("handyCap", "-")
         ),
-        "레이팅": sorted_df.get("rating", "-"),
-        "기수 1년승률": sorted_df["기수_1년승률(%)"].apply(
-            lambda x: f"{x:.1f}%"
-        ),
-        "마필 1년승률": sorted_df["마필_1년승률(%)"].apply(
-            lambda x: f"{x:.1f}%"
-        ),
+        "레이팅": rating_medals,
+        "기수 1년승률": jk_win_medals,
+        "마필 1년승률": hr_win_medals,
         "AI 승률(%)": sorted_df["AI_승률_val"],
         "단승배당": sorted_df["단승배당"],
         "EV (기대값)": sorted_df["EV_기대값"].apply(lambda x: f"{x:+.2f}"),
@@ -403,7 +423,7 @@ if st.button("🚀 AI 퀀트 분석 및 시각화 리포트 생성"):
         "체중변화": sorted_df["체중변화"],
     })
 
-    # 막대 그래프(Progress Bar)를 포함한 종합 표출
+    # 막대 그래프(Progress Bar)를 포함한 표출
     st.dataframe(
         display_df,
         column_config={
