@@ -29,73 +29,76 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ==========================================
+# 1. API 설정 및 문제의 엔드포인트 정의 (구버전)
+# ==========================================
 DECODING_KEY = "h7qTh7gmeKJ49Z3vL/4Oss49MVNvYWqGYyDyJgk8cUGs99uBTP1Qit3jk0qs8UVkMiqYWuLoxnNhd6nHuGKA2w=="
+ENCODED_KEY = "h7qTh7gmeKJ49Z3vL%2F4Oss49MVNvYWqGYyDyJgk8cUGs99uBTP1Qit3jk0qs8UVkMiqYWuLoxnNhd6nHuGKA2w%3D%3D"
+
+# ⚠️ 문제가 발생 중인 구버전 API 엔드포인트 맵
+API_BASE_URL = "http://apis.data.go.kr/B551015"
+
+ENDPOINTS = {
+    "race_horse": f"{API_BASE_URL}/API21_1/raceHorseList_1",      # 출전표 (구버전 -> API214_1 개편 필요)
+    "horse_weight": f"{API_BASE_URL}/API25/horseWeightList",       # 마체중
+    "jockey": f"{API_BASE_URL}/API22/jockeyList",                  # 기수 (구버전 -> API12_1 개편 필요)
+    "total_record": f"{API_BASE_URL}/API24/totalRecordList",      # 통산성적
+    "odds": f"{API_BASE_URL}/API28/oddsInfoList",                  # 배당 (구버전 -> API160_1/API301 개편 필요)
+    "track": f"{API_BASE_URL}/API30/trackConditionList",           # 주로/날씨 (구버전 -> API189_1 개편 필요)
+    "race_result": f"{API_BASE_URL}/API27_1/raceResultList_1"      # 결과 (구버전 -> API299 개편 필요)
+}
 
 # ==========================================
-# 1. API 수신 및 날짜 연산 모듈
+# 2. 실제 HTTP 호출 및 파싱 모듈
 # ==========================================
 def fetch_api_dataframe(url, params):
+    """
+    KRA API 단일 호출 함수
+    """
     try:
-        response = requests.get(url, params=params, timeout=6)
+        # serviceKey를 params와 결합하여 호출
+        full_params = {"serviceKey": DECODING_KEY, **params}
+        response = requests.get(url, params=full_params, timeout=6)
+        
         if response.status_code == 200:
             root = ET.fromstring(response.content)
             res_code = root.findtext(".//resultCode")
-            if res_code and res_code not in ["00", "0", "NORMAL_SERVICE", "OK"]:
-                return pd.DataFrame()
-            items = root.findall(".//item")
-            data = [{child.tag: child.text for child in item} for item in items]
-            return pd.DataFrame(data)
-    except Exception:
-        pass
+            
+            if res_code in ["00", "0", "NORMAL_SERVICE", "OK"]:
+                items = root.findall(".//item")
+                if items:
+                    data = [{child.tag: child.text for child in item} for item in items]
+                    return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"API 호출 에러 발생: {url} -> {e}")
     return pd.DataFrame()
-
-def generate_all_possible_dates():
-    today = datetime.date.today()
-    race_dates = []
-    for i in range(-14, 30):
-        d = today - datetime.timedelta(days=i)
-        if d.weekday() in [3, 4, 5, 6]:
-            race_dates.append(d.strftime("%Y%m%d"))
-    return sorted(race_dates, reverse=True)
-
-@st.cache_data(ttl=180)
-def get_active_meets_for_date(target_date):
-    active_meets = []
-    for meet_code in ["1", "2", "3"]:
-        params = {
-            "serviceKey": DECODING_KEY,
-            "pageNo": "1",
-            "numOfRows": "5",
-            "meet": meet_code,
-            "rc_date": target_date,
-        }
-        df = fetch_api_dataframe("http://apis.data.go.kr/B551015/API21_1/raceHorseList_1", params)
-        if not df.empty:
-            active_meets.append(meet_code)
-
-    return active_meets if active_meets else ["1", "2", "3"]
 
 @st.cache_data(ttl=180)
 def collect_kra_data(meet_code, target_date):
+    """
+    모든 API 데이터를 수집하고 Merge하는 파이프라인
+    """
     base_params = {
-        "serviceKey": DECODING_KEY,
         "pageNo": "1",
         "numOfRows": "100",
         "meet": meet_code,
         "rc_date": target_date,
     }
 
-    df_race = fetch_api_dataframe("http://apis.data.go.kr/B551015/API21_1/raceHorseList_1", base_params)
+    # 1) 출전표 수신
+    df_race = fetch_api_dataframe(ENDPOINTS["race_horse"], base_params)
     if df_race.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df_weight = fetch_api_dataframe("http://apis.data.go.kr/B551015/API25/horseWeightList", base_params)
-    df_jockey = fetch_api_dataframe("http://apis.data.go.kr/B551015/API22/jockeyList", base_params)
-    df_record = fetch_api_dataframe("http://apis.data.go.kr/B551015/API24/totalRecordList", base_params)
-    df_odds = fetch_api_dataframe("http://apis.data.go.kr/B551015/API28/oddsInfoList", base_params)
-    df_track = fetch_api_dataframe("http://apis.data.go.kr/B551015/API30/trackConditionList", base_params)
-    df_result = fetch_api_dataframe("http://apis.data.go.kr/B551015/API27_1/raceResultList_1", base_params)
+    # 2) 부가 정보 수신
+    df_weight = fetch_api_dataframe(ENDPOINTS["horse_weight"], base_params)
+    df_jockey = fetch_api_dataframe(ENDPOINTS["jockey"], base_params)
+    df_record = fetch_api_dataframe(ENDPOINTS["total_record"], base_params)
+    df_odds = fetch_api_dataframe(ENDPOINTS["odds"], base_params)
+    df_track = fetch_api_dataframe(ENDPOINTS["track"], base_params)
+    df_result = fetch_api_dataframe(ENDPOINTS["race_result"], base_params)
 
+    # 3) 데이터 병합 (Merge)
     df_merged = df_race.copy()
 
     if not df_weight.empty and "hrName" in df_weight.columns:
@@ -114,6 +117,7 @@ def collect_kra_data(meet_code, target_date):
         cols = [c for c in ["chulNo", "winOdds", "plcOdds"] if c in df_odds.columns]
         df_merged = pd.merge(df_merged, df_odds[cols], on="chulNo", how="left")
 
+    # 수치형 컬럼 전처리 및 기본값 채우기
     numeric_defaults = {
         "handyCap": 55.0, "nowWeight": 480.0, "chgWeight": 0.0,
         "jkWinRt": 10.0, "hrWinRt": 10.0, "ord1Cnt": 1.0,
@@ -129,7 +133,7 @@ def collect_kra_data(meet_code, target_date):
     return df_merged, df_track, df_result
 
 # ==========================================
-# 2. Race-level 의사결정 엔진
+# 3. Race-level 의사결정 엔진
 # ==========================================
 def predict_race_decision(df_raw, df_track, selected_race):
     X = df_raw.copy()
@@ -171,127 +175,58 @@ def predict_race_decision(df_raw, df_track, selected_race):
     gap = top1["AI_승률(%)"] - top2["AI_승률(%)"]
     ev = top1["EV_기대값"]
 
-    # 하루 3만원 예산 한도 내 등급 판단
+    # 등급 판단
     if ev >= 0.50 and gap >= 12.0:
-        grade = "🔥 S급 (최고 가치)"
-        badge_cls = "badge-s"
-        bet_amount = 5000
-        action = "BET"
+        grade, badge_cls, bet_amount, action = "🔥 S급 (최고 가치)", "badge-s", 5000, "BET"
     elif ev >= 0.20 and gap >= 8.0:
-        grade = "🔷 A급 (우수)"
-        badge_cls = "badge-a"
-        bet_amount = 3000
-        action = "BET"
+        grade, badge_cls, bet_amount, action = "🔷 A급 (우수)", "badge-a", 3000, "BET"
     elif ev >= 0.10 and gap >= 5.0:
-        grade = "📙 B급 (일반)"
-        badge_cls = "badge-b"
-        bet_amount = 2000
-        action = "BET"
+        grade, badge_cls, bet_amount, action = "📙 B급 (일반)", "badge-b", 2000, "BET"
     else:
-        grade = "🔴 C/D급 (PASS 권장)"
-        badge_cls = "badge-pass"
-        bet_amount = 0
-        action = "PASS"
+        grade, badge_cls, bet_amount, action = "🔴 C/D급 (PASS 권장)", "badge-pass", 0, "PASS"
 
-    reasons = []
-    if top1["hrWinRt"] >= 15.0: reasons.append(f"말 통산 승률 우수 ({top1['hrWinRt']}%)")
-    if top1["jkWinRt"] >= 12.0: reasons.append(f"기수 승률 상위권 ({top1['jkWinRt']}%)")
-    if top1["rating"] >= 50: reasons.append(f"레이팅 보증 ({top1['rating']})")
-    if top1["AI_EDGE(%p)"] > 5.0: reasons.append(f"시장 대비 높은 AI EDGE (+{top1['AI_EDGE(%p)']}%p)")
-    if not reasons: reasons.append("전반적 스탯 안정성 보유")
-
-    return sorted_df, track_moisture, track_state_str, grade, badge_cls, bet_amount, action, gap, reasons
+    return sorted_df, track_moisture, track_state_str, grade, badge_cls, bet_amount, action, gap
 
 # ==========================================
-# 3. Streamlit 대시보드 UI
+# 4. Streamlit 메인 UI
 # ==========================================
 st.title("🏇 KRA AI 개인용 경마 매매 시스템")
-st.caption("하루 최대 30,000원 위험 관리 & 의사결정 대시보드")
+st.caption("실시간 API 연동 및 의사결정 콘솔")
 
-with st.expander("⚙️ 경기 일자 및 경마장 선택", expanded=True):
-    col1, col2 = st.columns(2)
+col1, col2 = st.columns(2)
+with col1:
+    target_date_str = st.text_input("📅 경기 날짜 (YYYYMMDD)", value="20260905")
+    meet_choice = st.selectbox("🏟️ 경마장", options=["1", "2", "3"], format_func=lambda x: {"1": "서울", "2": "부산경남", "3": "제주"}[x])
 
-    with col1:
-        all_dates = generate_all_possible_dates()
-        target_date_str = st.selectbox(
-            "📅 경기 날짜 선택",
-            options=all_dates,
-            format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}",
-        )
+with col2:
+    selected_race = st.number_input("🏁 경주 번호", min_value=1, max_value=15, value=1)
 
-        active_meets = get_active_meets_for_date(target_date_str)
-        meet_choice = st.selectbox(
-            "🏟️ 경마장 선택",
-            options=active_meets,
-            format_func=lambda x: {"1": "서울 렛츠런파크", "2": "부산경남", "3": "제주"}[x],
-        )
-
-    with col2:
-        df_check, _, _ = collect_kra_data(meet_choice, target_date_str)
-        if not df_check.empty and "rcNo" in df_check.columns:
-            actual_races = sorted(pd.to_numeric(df_check["rcNo"], errors="coerce").dropna().unique().astype(int).tolist())
-            race_options = actual_races if actual_races else list(range(1, 12))
-        else:
-            race_options = list(range(1, 12))
-
-        selected_race = st.selectbox("🏁 경주 번호 (RACE)", options=race_options, index=0)
-
-run_button = st.button("🚀 실시간 AI 매매 의사결정 분석")
-
-if run_button:
-    with st.spinner(f"[{target_date_str}] {selected_race}경주 API 수신 및 분석 중..."):
-        df_raw, df_track, df_real_result = collect_kra_data(meet_choice, target_date_str)
+if st.button("🚀 실시간 KRA API 데이터 분석"):
+    with st.spinner("API 데이터 호출 중..."):
+        df_raw, df_track, df_result = collect_kra_data(meet_choice, target_date_str)
 
         if df_raw.empty:
-            st.error("⏳ 해당 날짜의 API 데이터가 아직 준비되지 않았습니다.")
+            st.error("❌ API 데이터 수신 실패! (엔드포인트 에러 또는 서버 응답 없음)")
         else:
-            df_target_race = df_raw[df_raw["rcNo"].astype(str) == str(selected_race)].copy() if "rcNo" in df_raw.columns else df_raw.copy()
-
-            if df_target_race.empty:
-                st.warning(f"⚠️ {selected_race}경주 출전 정보가 없습니다.")
+            df_target = df_raw[df_raw["rcNo"].astype(str) == str(selected_race)].copy()
+            
+            if df_target.empty:
+                st.warning(f"{selected_race}경주 데이터가 존재하지 않습니다.")
             else:
-                race_data, moisture, track_state, grade, badge_cls, bet_amount, action, gap, reasons = predict_race_decision(
-                    df_target_race, df_track, selected_race
+                race_data, moisture, track_state, grade, badge_cls, bet_amount, action, gap = predict_race_decision(
+                    df_target, df_track, selected_race
                 )
 
                 st.markdown(
                     f"""
                 <div class="metric-card">
                     <h3>📢 의사결정: <span class="{badge_cls}">{grade}</span></h3>
-                    <p><b>추천 베팅금액:</b> <span style="color:#f59e0b; font-size:1.3em; font-weight:bold;">{bet_amount:,}원</span> (일일 잔여한도 차감 적용)</p>
+                    <p><b>추천 베팅금액:</b> <span style="color:#f59e0b; font-size:1.3em; font-weight:bold;">{bet_amount:,}원</span></p>
                     <p>💧 함수율: {moisture}% | ☀️ 주로상태: {track_state} | Top1-2 격차: {gap:.1f}%p</p>
                 </div>
                 """,
                     unsafe_allow_html=True,
                 )
 
-                top1 = race_data.iloc[0]
-
-                st.subheader(f"🥇 [{selected_race}경주] AI 추천 1위: {top1['chulNo']}번 ({top1['hrName']})")
-                col_a, col_b, col_c = st.columns(3)
-                col_a.metric("AI 승률", f"{top1['AI_승률(%)']}%")
-                col_b.metric("시장 승률", f"{top1['시장_승률(%)']}%")
-                col_c.metric("AI EDGE", f"+{top1['AI_EDGE(%p)']}%p")
-
-                st.markdown("**💡 AI 핵심 선택 이유:**")
-                for r in reasons:
-                    st.write(f"• {r}")
-
-                st.subheader("📊 출전마 전체 AI 분석표")
-                display_df = race_data[[
-                    "AI_예측순위", "chulNo", "hrName", "jkName", "rating",
-                    "AI_승률(%)", "시장_승률(%)", "AI_EDGE(%p)", "winOdds", "EV_기대값"
-                ]].copy()
-
-                rename_map = {
-                    "AI_예측순위": "순위", "chulNo": "게이트", "hrName": "마명",
-                    "jkName": "기수명", "rating": "레이팅", "AI_승률(%)": "AI승률",
-                    "시장_승률(%)": "시장승률", "AI_EDGE(%p)": "EDGE", "winOdds": "배당률", "EV_기대값": "EV"
-                }
-                display_df.rename(columns=rename_map, inplace=True)
-                st.dataframe(display_df, use_container_width=True)
-
-                if action == "PASS":
-                    st.error("🔒 이 경주는 AI 신뢰도가 낮아 **[PASS (관망)]**를 권장합니다.")
-                else:
-                    st.success(f"💰 **[매매 실행]**: {top1['chulNo']}번({top1['hrName']}) 단승식 **{bet_amount:,}원** 투입 권장")
+                st.subheader("📊 출전마 분석표")
+                st.dataframe(race_data[["AI_예측순위", "chulNo", "hrName", "jkName", "AI_승률(%)", "시장_승률(%)", "AI_EDGE(%p)", "winOdds", "EV_기대값"]], use_container_width=True)
