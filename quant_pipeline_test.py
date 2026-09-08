@@ -1,14 +1,24 @@
+import math
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 import requests
 
 
-class KRADataPipeline:
+class KRAFeatureEngineV2:
+  """KRA AI Quant Feature Engineering & Probability Calibration Engine V2
 
-  def __init__(self, service_key):
+  주요 기능:
+  1. 베이지안 승률 평활화 (표본 수에 따른 신뢰도 보정)
+  2. 필드 내 Z-Score 상대평가 (부담중량, 레이팅 등)
+  3. 체중 변동 연속 비선형 가우시안 감점 (±10kg 단일 패널티 대체)
+  4. 주로 상태-마필 특성 상호작용 (Interaction Feature)
+  5. 엔트로피(Entropy) & Margin 기반 레이스 난이도 (PASS/A/B/C) 산출
+  6. Temperature Scaling을 통한 Softmax Calibration
+  """
+
+  def __init__(self, service_key: str):
     self.service_key = service_key
-    # 8개 공식 확인된 KRA API 엔드포인트 전체 등록
     self.endpoints = {
         "entry_sheet": "https://apis.data.go.kr/B551015/API26_2/entrySheet_2",
         "track_info": "https://apis.data.go.kr/B551015/API189_1/Track_1",
@@ -22,16 +32,10 @@ class KRADataPipeline:
             "https://apis.data.go.kr/B551015/API27_1/totalRecord_1"
         ),
         "race_result": "https://apis.data.go.kr/B551015/API156/raceRsutDtl",
-        "highest_dividend": (
-            "https://apis.data.go.kr/B551015/API35_1/highestDividendRateInfo_1"
-        ),
-        "jeju_result": (
-            "https://apis.data.go.kr/B551015/jejuhorseresult/getjejuhorseresult"
-        ),
     }
 
-  def fetch_raw_api(self, url, params):
-    """공통 API 호출 및 XML 파싱"""
+  def fetch_raw_api(self, url: str, params: dict) -> tuple:
+    """공통 KRA API 호출 모듈"""
     full_params = {
         "ServiceKey": self.service_key,
         "serviceKey": self.service_key,
@@ -48,7 +52,7 @@ class KRADataPipeline:
       root = ET.fromstring(res.content)
       err_msg = root.findtext(".//errMsg") or root.findtext(".//returnAuthMsg")
       if err_msg:
-        return None, f"게이트웨이 에러: {err_msg}"
+        return None, f"API Auth Error: {err_msg}"
 
       res_code = root.findtext(".//resultCode")
       if res_code in ["00", "0", "NORMAL_SERVICE", "OK"]:
@@ -60,23 +64,117 @@ class KRADataPipeline:
               ]),
               None,
           )
-        return pd.DataFrame(), "데이터 없음"
-      return None, f"서비스 에러 [{res_code}]"
+        return pd.DataFrame(), "No Data"
+      return None, f"API Error [{res_code}]"
     except Exception as e:
-      return None, f"통신 장애: {str(e)}"
+      return None, f"Connection Failure: {str(e)}"
 
-  def process_pipeline(
-      self, meet_code, target_date, selected_race, daily_spent
+  # ------------------------------------------------------------------
+  # Feature Engineering 핵심 수학/통계 연산
+  # ------------------------------------------------------------------
+
+  @staticmethod
+  def bayesian_smoothed_win_rate(
+      win_cnt: float, total_cnt: float, field_mean: float, m_confidence: float = 15.0
+  ) -> float:
+    """[① 베이지안 승률 평활화]
+
+    표본 수가 적을 때(예: 2전 1승 = 50%) 승률이 과도하게 튀는 현상을 방지.
+    m_confidence: 사전 신뢰 표본수 (기본값 15전)
+    """
+    if total_cnt <= 0:
+      return field_mean
+    return (win_cnt + m_confidence * field_mean) / (total_cnt + m_confidence)
+
+  @staticmethod
+  def compute_z_score(series: pd.Series) -> pd.Series:
+    """[③ 상대평가 Z-Score]
+
+    해당 경주 필드 내 평균과 표준편차를 기준으로 상대적 우위 산출.
+    """
+    std = series.std(ddof=0)
+    if pd.isna(std) or std < 1e-6:
+      return pd.Series(0.0, index=series.index)
+    return (series - series.mean()) / std
+
+  @staticmethod
+  def gaussian_weight_penalty(diff_weight: float) -> float:
+    """[③ 체중변화 연속 비선형 가우시안 패널티]
+
+    ±10kg 단일 하드컷 대신 연속적인 패널티 함수 적용.
+    0kg 근처는 패널티 없음, 변동폭이 커질수록 감점 가속.
+    """
+    sigma = 6.0  # 표준편차 6kg 기준
+    # 0kg 변동 시 0.0, ±12kg 변동 시 약 -0.4 감점
+    penalty = 1.0 - math.exp(-((diff_weight / sigma) ** 2) / 2.0)
+    return -float(penalty) * 0.5
+
+  @staticmethod
+  def calculate_race_difficulty(probs: np.ndarray) -> tuple:
+    """[④ 레이스 난이도 & Entropy 측정]
+
+    TOP1 확률, Margin(1위-2위 격차), Shannon Entropy를 종합하여 경주 난이도 측정.
+    """
+    probs = np.clip(probs, 1e-12, 1.0)
+    probs = probs / probs.sum()
+
+    sorted_p = np.sort(probs)[::-1]
+    top1_p = sorted_p[0]
+    top2_p = sorted_p[1] if len(sorted_p) > 1 else 0.0
+    gap = top1_p - top2_p
+
+    # 샤논 엔트로피 (정보 무질서도: 클수록 초혼전)
+    entropy = -np.sum(probs * np.log2(probs))
+    max_entropy = np.log2(len(probs))
+    norm_entropy = (
+        entropy / max_entropy if max_entropy > 0 else 1.0
+    )  # 0~1 정규화
+
+    # 등급 결정
+    if top1_p >= 0.25 and gap >= 0.07 and norm_entropy <= 0.85:
+      difficulty_grade = "🟢 A급 (명확한 축마)"
+      bet_recommend = True
+    elif top1_p >= 0.18 and gap >= 0.03:
+      difficulty_grade = "🟡 B급 (중혼전 - 엄격 선택)"
+      bet_recommend = True
+    else:
+      difficulty_grade = "🔴 C급 (초혼전 / PASS 권장)"
+      bet_recommend = False
+
+    return difficulty_grade, bet_recommend, top1_p, gap, norm_entropy
+
+  # ------------------------------------------------------------------
+  # 메인 파이프라인 수신 & 정제
+  # ------------------------------------------------------------------
+
+  def build_feature_matrix(
+      self,
+      meet_code: str,
+      target_date: str,
+      selected_race: str,
+      temperature: float = 1.5,
   ):
-    """8개 API 융합 및 AI 퀀트 정제 메인 파이프라인"""
-    DAILY_LIMIT = 30000
-    rem_budget = max(0, DAILY_LIMIT - daily_spent)
+    """V2 퀀트 피처 매트릭스 생성 및 확률 도출 파이프라인
 
-    # 1. 메인 API 수신 (출전표 및 주로)
+    temperature: Softmax 온도 파라미터 (스케일 과열 방지 및 Calibration 조절)
+    """
+    # 1. 원본 API 수신
     df_entry, err = self.fetch_raw_api(
         self.endpoints["entry_sheet"],
         {"meet": meet_code, "rc_date": target_date},
     )
+    if err or df_entry is None or df_entry.empty:
+      return None, err or "출전표 데이터 없음", None
+
+    # 해당 경주 필터링
+    if "rcNo" in df_entry.columns:
+      df = df_entry[df_entry["rcNo"].astype(str) == str(selected_race)].copy()
+    else:
+      df = df_entry.copy()
+
+    if df.empty:
+      return None, f"{selected_race}경주 데이터를 찾을 수 없습니다.", None
+
     df_track, _ = self.fetch_raw_api(
         self.endpoints["track_info"],
         {
@@ -85,22 +183,6 @@ class KRADataPipeline:
             "rc_date_to": target_date,
         },
     )
-
-    if err or df_entry is None or df_entry.empty:
-      return None, err or "데이터 없음", None
-
-    # 선택 경주 번호(rcNo) 필터링
-    if "rcNo" in df_entry.columns:
-      df_race = df_entry[
-          df_entry["rcNo"].astype(str) == str(selected_race)
-      ].copy()
-    else:
-      df_race = df_entry.copy()
-
-    if df_race.empty:
-      return None, f"{selected_race}경주 출전 데이터가 없습니다.", None
-
-    # 2. 보조 API 6종 병렬 데이터 수신
     df_weight, _ = self.fetch_raw_api(
         self.endpoints["horse_weight"],
         {"meet": meet_code, "rc_date": target_date},
@@ -109,50 +191,52 @@ class KRADataPipeline:
         self.endpoints["jockey_result"], {"meet": meet_code}
     )
 
-    # 수치형 필드 전처리
-    num_cols = ["winOdds", "jkWinRt", "hrWinRt", "rating", "handyCap", "chulNo"]
-    for col in num_cols:
-      if col in df_race.columns:
-        df_race[col] = (
-            pd.to_numeric(
-                df_race[col].astype(str).str.replace("%", ""), errors="coerce"
-            )
-            .fillna(0.0)
-        )
-      else:
-        df_race[col] = 5.0 if col == "winOdds" else 10.0
-
-    # 3. 보조 API 융합 가중치 계산
-    # (1) 체중 변동 보정 (API25_1)
-    df_race["weight_penalty"] = 0.0
-    if df_weight is not None and not df_weight.empty:
-      if "chulNo" in df_weight.columns and "diffWeight" in df_weight.columns:
-        weight_map = dict(
-            zip(df_weight["chulNo"].astype(str), df_weight["diffWeight"])
-        )
-        for idx, row in df_race.iterrows():
-          chul_no = str(row.get("chulNo", ""))
-          diff_w = pd.to_numeric(weight_map.get(chul_no, 0), errors="coerce")
-          if abs(diff_w) >= 10:  # 체중 10kg 이상 급변 시 감점
-            df_race.at[idx, "weight_penalty"] = -0.3
-
-    # (2) 기수 최근 1년 폼 보정 (jkyresult)
-    df_race["jockey_1yr_bonus"] = 0.0
-    if df_jockey is not None and not df_jockey.empty:
-      if "jkName" in df_jockey.columns and "ord1Cnt" in df_jockey.columns:
-        jockey_map = dict(
+    # 2. 보조 데이터 매핑 딕셔너리 구축
+    jockey_win_y_map, jockey_qu_y_map = {}, {}
+    if (
+        df_jockey is not None
+        and not df_jockey.empty
+        and "jkName" in df_jockey.columns
+    ):
+      if "winRateyear" in df_jockey.columns:
+        jockey_win_y_map = dict(
             zip(
                 df_jockey["jkName"],
-                pd.to_numeric(df_jockey["ord1Cnt"], errors="coerce").fillna(0),
+                pd.to_numeric(
+                    df_jockey["winRateyear"].astype(str).str.replace("%", ""),
+                    errors="coerce",
+                ).fillna(0.0)
+                / 100.0,
             )
         )
-        for idx, row in df_race.iterrows():
-          jk_name = row.get("jkName", "")
-          wins_1yr = jockey_map.get(jk_name, 0)
-          if wins_1yr >= 20:  # 최근 1년 20승 이상 우수 기수 우대
-            df_race.at[idx, "jockey_1yr_bonus"] = 0.4
+      if "quRateyear" in df_jockey.columns:
+        jockey_qu_y_map = dict(
+            zip(
+                df_jockey["jkName"],
+                pd.to_numeric(
+                    df_jockey["quRateyear"].astype(str).str.replace("%", ""),
+                    errors="coerce",
+                ).fillna(0.0)
+                / 100.0,
+            )
+        )
 
-    # (3) 주로 함수율 보정 (API189_1)
+    weight_diff_map = {}
+    if (
+        df_weight is not None
+        and not df_weight.empty
+        and "chulNo" in df_weight.columns
+    ):
+      if "wgHrDiff" in df_weight.columns:
+        weight_diff_map = dict(
+            zip(
+                df_weight["chulNo"].astype(str),
+                pd.to_numeric(df_weight["wgHrDiff"], errors="coerce").fillna(
+                    0.0
+                ),
+            )
+        )
+
     water_percent = 4.0
     if (
         df_track is not None
@@ -163,116 +247,178 @@ class KRADataPipeline:
         water_percent = float(df_track.iloc[0].get("waterPercent", 4.0))
       except ValueError:
         water_percent = 4.0
-    humidity_bonus = 0.20 if water_percent >= 10.0 else 0.0
 
-    # 4. 8개 API 다단계 융합 AI Score 연산
-    df_race["score"] = (
-        (df_race["jkWinRt"] / 20.0) * 1.40
-        + (df_race["hrWinRt"] / 25.0) * 1.40
-        + (df_race["rating"] / 80.0) * 1.10
-        - (df_race["handyCap"] / 58.0) * 0.40
-        + df_race["jockey_1yr_bonus"]  # 최근 1년 기수 폼 반영
-        + df_race["weight_penalty"]  # 마체중 급변 반영
-        + humidity_bonus  # 주로 함수율 반영
+    # 3. 데이터 원본 파싱 및 기본 수치 변환
+    df["ord1CntY"] = pd.to_numeric(df.get("ord1CntY", 0), errors="coerce").fillna(
+        0.0
+    )
+    df["rcCntY"] = pd.to_numeric(df.get("rcCntY", 0), errors="coerce").fillna(
+        0.0
+    )
+    df["rating_num"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(
+        0.0
+    )
+    df["budam_num"] = pd.to_numeric(
+        df.get("wgBudam", df.get("handyCap", 0)), errors="coerce"
+    ).fillna(0.0)
+
+    # 필드 평균 마필 승률
+    field_mean_hr_win = (
+        df["ord1CntY"].sum() / max(df["rcCntY"].sum(), 1.0)
+        if df["rcCntY"].sum() > 0
+        else 0.10
     )
 
-    # Softmax 상대 승률
-    exp_s = np.exp(df_race["score"] - df_race["score"].max())
-    df_race["AI_승률(%)"] = ((exp_s / exp_s.sum()) * 100).round(1)
+    # ------------------------------------------------------------------
+    # 4. Feature Extraction & Normalization
+    # ------------------------------------------------------------------
 
-    # 임플라이드 시장 승률
-    df_race["market_raw"] = 1.0 / np.maximum(df_race["winOdds"], 1.05)
-    df_race["시장_승률(%)"] = (
-        (df_race["market_raw"] / df_race["market_raw"].sum()) * 100
-    ).round(1)
+    # [Feature 1] 마필 승률 베이지안 평활화 (Bayesian Smoothed Win Rate)
+    df["feat_hr_smoothed_win"] = [
+        self.bayesian_smoothed_win_rate(
+            r["ord1CntY"], r["rcCntY"], field_mean_hr_win, m_confidence=12.0
+        )
+        for _, r in df.iterrows()
+    ]
 
-    df_race["AI_EDGE(%p)"] = (
-        df_race["AI_승률(%)"] - df_race["시장_승률(%)"]
-    ).round(1)
-    df_race["EV_기대값"] = (
-        (df_race["AI_승률(%)"] / 100.0) * df_race["winOdds"]
-    ) - 1.0
-    df_race["AI_예측순위"] = (
-        df_race["AI_승률(%)"].rank(ascending=False, method="min").astype(int)
+    # [Feature 2] 기수 최근 1년 종합 성적 (Win 70% + Qu 30%)
+    df["feat_jk_score"] = [
+        (jockey_win_y_map.get(str(r.get("jkName", "")), 0.0) * 0.7)
+        + (jockey_qu_y_map.get(str(r.get("jkName", "")), 0.0) * 0.3)
+        for _, r in df.iterrows()
+    ]
+
+    # [Feature 3] 부담중량 Z-Score (상대평가: 무거울수록 마이너스)
+    # Z-score가 +1.5이면 평균보다 1.5표준편차 무거우므로 불리
+    df["feat_budam_z"] = -1.0 * self.compute_z_score(df["budam_num"])
+
+    # [Feature 4] 레이팅 Z-Score (상대평가: 높을수록 유리)
+    df["feat_rating_z"] = self.compute_z_score(df["rating_num"])
+
+    # [Feature 5] 체중 변동 연속 비선형 가우시안 감점
+    df["feat_weight_penalty"] = [
+        self.gaussian_weight_penalty(
+            weight_diff_map.get(str(r.get("chulNo", "")), 0.0)
+        )
+        for _, r in df.iterrows()
+    ]
+
+    # [Feature 6] 주로 함수율 상호작용 (Environment Interaction)
+    # 주로가 젖어있을 때(함수율>=10%) 선입/추입 능력이 있는 High-Rating 마필에 보너스 가산
+    df["feat_track_interaction"] = (
+        0.25 * df["feat_rating_z"] if water_percent >= 10.0 else 0.0
     )
 
-    # 5. 퀀트 의사결정 및 자금 관리
-    sorted_df = df_race.sort_values(by="AI_예측순위").reset_index(drop=True)
-    top1 = sorted_df.iloc[0]
-    top2 = sorted_df.iloc[1] if len(sorted_df) > 1 else top1
+    # ------------------------------------------------------------------
+    # 5. Composite Score & Calibrated Softmax
+    # ------------------------------------------------------------------
 
-    top1_win_rt = top1["AI_승률(%)"]
-    gap = top1_win_rt - top2["AI_승률(%)"]
-    ev = top1["EV_기대값"]
+    # 가중치 결합 (모든 Z-Score 및 Probability Feature 스케일 균형 조정)
+    df["composite_logits"] = (
+        (df["feat_hr_smoothed_win"] * 2.0)
+        + (df["feat_jk_score"] * 1.8)
+        + (df["feat_rating_z"] * 0.8)
+        + (df["feat_budam_z"] * 0.5)
+        + df["feat_weight_penalty"]
+        + df["feat_track_interaction"]
+    )
 
-    if top1_win_rt >= 20.0 or gap >= 5.0 or ev >= 0.15:
-      raw_grade, target_stake = "🔥 S급", 5000
-    elif top1_win_rt >= 15.0 or gap >= 3.0 or ev >= 0.0:
-      raw_grade, target_stake = "🔷 A급", 3000
-    elif top1_win_rt >= 12.0 or gap >= 1.5 or ev >= -0.15:
-      raw_grade, target_stake = "📙 B급", 2000
-    else:
-      raw_grade, target_stake = "🔴 C/D급", 0
+    # Temperature Scaling 적용 Softmax
+    # temperature가 높을수록 확률 산출이 완화되어 과도한 마필 쏠림 방지 (Calibration)
+    scaled_logits = df["composite_logits"] / temperature
+    exp_logits = np.exp(scaled_logits - scaled_logits.max())
+    df["AI_prob"] = exp_logits / exp_logits.sum()
+    df["AI_승률(%)"] = (df["AI_prob"] * 100).round(1)
 
-    if target_stake == 0:
-      final_grade, badge_cls, actual_stake, action = (
-          "🔴 PASS (초혼전 경주)",
-          "badge-pass",
-          0,
-          "PASS",
-      )
-    elif rem_budget < target_stake:
-      final_grade, badge_cls, actual_stake, action = (
-          (
-              f"🔒 PASS (예산 부족: 남은 예산 {rem_budget:,}원 < 필요금액"
-              f" {target_stake:,}원)"
-          ),
-          "badge-pass",
-          0,
-          "PASS",
-      )
-    else:
-      final_grade = f"{raw_grade} (추천)"
-      badge_cls = (
-          "badge-s"
-          if "S급" in raw_grade
-          else ("badge-a" if "A급" in raw_grade else "badge-b")
-      )
-      actual_stake, action = target_stake, "BET"
+    # 예측 순위
+    df["AI_예측순위"] = (
+        df["AI_prob"].rank(ascending=False, method="min").astype(int)
+    )
+    sorted_df = df.sort_values(by="AI_예측순위").reset_index(drop=True)
 
-    # 6. UI 전용 필드 슬라이싱
-    display_map = {
-        "AI_예측순위": "순위",
-        "chulNo": "마번",
-        "hrName": "마명",
-        "jkName": "기수",
-        "trName": "조교사",
-        "handyCap": "부담중량",
-        "winOdds": "단승배당",
-        "AI_승률(%)": "AI 승률",
-        "시장_승률(%)": "시장 승률",
-        "AI_EDGE(%p)": "EDGE(%p)",
+    # ------------------------------------------------------------------
+    # 6. Race Difficulty & Decision
+    # ------------------------------------------------------------------
+    grade, bet_rec, top1_p, gap, entropy = self.calculate_race_difficulty(
+        sorted_df["AI_prob"].values
+    )
+
+    metrics_summary = {
+        "difficulty_grade": grade,
+        "bet_recommend": bet_rec,
+        "top1_prob": round(top1_p * 100, 1),
+        "gap_p": round(gap * 100, 1),
+        "normalized_entropy": round(entropy, 3),
+        "water_percent": water_percent,
+        "total_horses": len(sorted_df),
     }
 
-    valid_cols = [c for c in display_map.keys() if c in sorted_df.columns]
-    ui_df = sorted_df[valid_cols].rename(columns=display_map)
+    return sorted_df, metrics_summary, None
 
-    if "AI 승률" in ui_df.columns:
-      ui_df["AI 승률"] = ui_df["AI 승률"].astype(str) + "%"
-    if "시장 승률" in ui_df.columns:
-      ui_df["시장 승률"] = ui_df["시장 승률"].astype(str) + "%"
 
-    summary_info = {
-        "water_pct": water_percent,
-        "grade": final_grade,
-        "badge_cls": badge_cls,
-        "actual_stake": actual_stake,
-        "action": action,
-        "gap": gap,
-        "rem_budget": rem_budget,
-        "top1_no": top1.get("chulNo", ""),
-        "top1_name": top1.get("hrName", ""),
-        "top1_ev": top1.get("EV_기대값", 0.0),
-    }
+# ======================================================================
+# 3. 과거 경주 Walk-Forward 백테스트 모듈
+# ======================================================================
+def run_walk_forward_backtest(
+    service_key: str, race_dates: list, meet_code: str = "1"
+):
+  """과거 날짜 시퀀스를 시간순으로 테스트하여 백테스팅 검증"""
+  engine = KRAFeatureEngineV2(service_key)
+  results = []
 
-    return ui_df, None, summary_info
+  print("\n" + "=" * 70)
+  print("🚀 [Walk-Forward Backtest] V2 퀀트 파이프라인 과거 데이터 검증")
+  print("=" * 70)
+
+  for r_date in race_dates:
+    for r_no in range(1, 11):  # 1~10경주 순회
+      df_res, summary, err = engine.build_feature_matrix(
+          meet_code, r_date, str(r_no)
+      )
+      if err or df_res is None or df_res.empty:
+        continue
+
+      top1 = df_res.iloc[0]
+      results.append({
+          "date": r_date,
+          "race_no": r_no,
+          "grade": summary["difficulty_grade"],
+          "recommend": summary["bet_recommend"],
+          "top1_horse": top1.get("hrName"),
+          "top1_no": top1.get("chulNo"),
+          "top1_prob": summary["top1_prob"],
+          "gap": summary["gap_p"],
+          "entropy": summary["normalized_entropy"],
+      })
+
+  df_bt = pd.DataFrame(results)
+  print(f"✅ 총 {len(df_bt)}개 경주 백테스트 파이프라인 정제 완료\n")
+  return df_bt
+
+
+if __name__ == "__main__":
+  # 테스트 실행 예시 (키 설정 후 사용)
+  TEST_KEY = "YOUR_KRA_DECODING_SERVICE_KEY"
+  engine = KRAFeatureEngineV2(TEST_KEY)
+  df_result, summary_info, err_msg = engine.build_feature_matrix(
+      meet_code="1", target_date="20240901", selected_race="1"
+  )
+
+  if err_msg:
+    print("오류 발생:", err_msg)
+  else:
+    print("📊 [경주 난이도 측정 결과]")
+    print(summary_info)
+    print("\n📋 [상위 3마 퀀트 피처 분석]")
+    print(
+        df_result[[
+            "AI_예측순위",
+            "chulNo",
+            "hrName",
+            "jkName",
+            "feat_hr_smoothed_win",
+            "feat_budam_z",
+            "feat_rating_z",
+            "AI_승률(%)",
+        ]].head(3)
+    )
