@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
-from kra_pipeline_v2 import KRAFeatureEngineV2
+# 🔥 파일명 quant_pipeline_test.py 에서 클래스를 정상적으로 가져옵니다.
+from quant_pipeline_test import KRAFeatureEngineV2
 
 st.set_page_config(
     page_title="KRA AI Quant System V2", page_icon="🏇", layout="wide"
@@ -17,7 +18,7 @@ def get_service_key():
     )
 
 
-st.title("🏇 KRA AI Quant System V2 (Z-Score & Calibration 적용)")
+st.title("🏇 KRA AI Quant System V2")
 st.caption("Bayesian Smoothing | Relative Z-Score | Shannon Entropy Difficulty")
 
 col1, col2, col3 = st.columns([2, 2, 1])
@@ -43,8 +44,7 @@ if st.button("🚀 V2 퀀트 분석 엔진 가동"):
   if err:
     st.error(f"파이프라인 장애: {err}")
   else:
-    # 1. 경주 난이도 헤더
-    status_color = "green" if summary["bet_recommend"] else "red"
+    status_color = "#22c55e" if summary["bet_recommend"] else "#ef4444"
     st.markdown(
         f"""
         <div style="background-color:#1e293b; padding:18px; border-radius:12px; color:white; margin-bottom:15px;">
@@ -66,7 +66,6 @@ if st.button("🚀 V2 퀀트 분석 엔진 가동"):
           " 격차가 적어 매매를 건너뜁니다."
       )
 
-    # 2. 메인 퀀트 테이블 표출
     st.subheader("📊 V2 피처 융합 및 AI 승률 데이터프레임")
 
     display_df = pd.DataFrame({
