@@ -1,128 +1,118 @@
-def run_ai_quant_decision(df_entry, df_track, daily_spent):
-  DAILY_LIMIT = 30000
-  rem_budget = max(0, DAILY_LIMIT - daily_spent)
+import streamlit as st
+# 동일한 디렉토리에 위치한 파이프라인 Class 로드
+from kra_pipeline import KRADataPipeline
 
-  df = df_entry.copy()
+# ==========================================
+# 0. UI 기본 레이아웃 및 CSS 설정
+# ==========================================
+st.set_page_config(
+    page_title="KRA AI 개인용 경마 매매 시스템",
+    page_icon="🏇",
+    layout="wide",
+)
 
-  # 1. 수치형 컬럼 보정
-  num_cols = ["winOdds", "jkWinRt", "hrWinRt", "rating", "handyCap", "chulNo"]
-  for col in num_cols:
-    if col in df.columns:
-      df[col] = (
-          pd.to_numeric(
-              df[col].astype(str).str.replace("%", ""), errors="coerce"
-          )
-          .fillna(0.0)
+st.markdown(
+    """
+    <style>
+    .main { padding: 0.8rem; }
+    .stButton>button { width: 100%; border-radius: 10px; font-weight: bold; background-color: #0284c7; color: white; height: 3.2em; }
+    .metric-card { background-color: #1e293b; padding: 20px; border-radius: 12px; color: white; margin-bottom: 15px; }
+    .badge-s { background-color: #15803d; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .badge-a { background-color: #0369a1; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .badge-b { background-color: #b45309; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .badge-pass { background-color: #b91c1c; color: white; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    .error-box { background-color: #450a0a; border: 1px solid #f87171; padding: 12px; border-radius: 8px; color: #fca5a5; }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def get_service_key():
+  """Secrets 또는 예비 키 수급"""
+  try:
+    return st.secrets["KRA_SERVICE_KEY"]
+  except Exception:
+    return st.session_state.get(
+        "custom_service_key",
+        "92ac0b865a4117f6158886b90c8ad86908d7d67bead9c9166eb0fef68cddd2da",
+    )
+
+
+# ==========================================
+# 1. 메인 대시보드 UI
+# ==========================================
+st.title("🏇 KRA AI 개인용 경마 매매 시스템")
+st.caption("실시간 마사회 API 정제 파이프라인 및 퀀트 의사결정 콘솔")
+
+# 일일 누적 사용금액 세션 관리
+if "daily_spent" not in st.session_state:
+  st.session_state["daily_spent"] = 0
+
+# 사이드바 예산 관리
+with st.sidebar:
+  st.header("💰 일일 자금 관리 현황")
+  st.metric("하루 한도 (DAILY_LIMIT)", "30,000원")
+  st.metric("오늘 누적 사용액", f"{st.session_state['daily_spent']:,}원")
+  st.metric("남은 베팅 가능 예산", f"{30000 - st.session_state['daily_spent']:,}원")
+  if st.button("🔄 리셋 (새로운 날 시작)"):
+    st.session_state["daily_spent"] = 0
+    st.rerun()
+
+col1, col2 = st.columns(2)
+with col1:
+  target_date = st.text_input("📅 경기 날짜 (YYYYMMDD)", value="20240901")
+  meet_choice = st.selectbox(
+      "🏟️ 경마장",
+      options=["1", "2", "3"],
+      format_func=lambda x: {"1": "서울", "2": "제주", "3": "부산경남"}[x],
+  )
+
+with col2:
+  selected_race = st.number_input(
+      "🏁 경주 번호", min_value=1, max_value=15, value=1
+  )
+
+if st.button("🚀 실시간 KRA 데이터 연동 및 AI 분석"):
+  with st.spinner("마사회 서버 통신 및 정제 파이프라인 가동 중..."):
+    # 파이프라인 인스턴스 생성 및 일괄 연산 실행
+    pipeline = KRADataPipeline(get_service_key())
+    ui_df, err, summary = pipeline.process_pipeline(
+        meet_choice, target_date, selected_race, st.session_state["daily_spent"]
+    )
+
+    if err:
+      st.markdown(
+          f'<div class="error-box"><h4>❌ 파이프라인 처리 오류</h4><pre>{err}</pre></div>',
+          unsafe_allow_html=True,
       )
     else:
-      df[col] = 5.0 if col == "winOdds" else 10.0
+      st.success("🟢 KRA 실시간 출전표 수신 및 퀀트 정제 완료!")
 
-  # 2. 주로 상태 (함수율) 파싱
-  water_percent = 4.0
-  if not df_track.empty and "waterPercent" in df_track.columns:
-    try:
-      water_percent = float(df_track.iloc[0].get("waterPercent", 4.0))
-    except ValueError:
-      water_percent = 4.0
+      # 상단 퀀트 의사결정 요약 카드
+      st.markdown(
+          f"""
+        <div class="metric-card">
+            <h3>의사결정: <span class="{summary['badge_cls']}">{summary['grade']}</span></h3>
+            <p><b>실제 추천 투입금:</b> <span style="color:#f59e0b; font-size:1.3em; font-weight:bold;">{summary['actual_stake']:,}원</span> (남은 한도: {summary['rem_budget']:,}원)</p>
+            <p>💧 주로 함수율: {summary['water_pct']}% | 🥇 1위 추천마: <b>{summary['top1_no']}번 ({summary['top1_name']})</b> | Top1-2 승률 격차: {summary['gap']:.1f}%p</p>
+        </div>
+        """,
+          unsafe_allow_html=True,
+      )
 
-  # 3. AI 가중치 스코어링 (기수+마필 능력치 및 주로적성 반영)
-  humidity_bonus = 0.20 if water_percent >= 10.0 else 0.0
-  df["score"] = (
-      (df["jkWinRt"] / 20.0) * 1.50  # 기수 최근 승률 가중치 강화
-      + (df["hrWinRt"] / 25.0) * 1.50  # 마필 승률 가중치 강화
-      + (df["rating"] / 80.0) * 1.20  # 레이팅 점수 반영
-      - (df["handyCap"] / 58.0) * 0.40
-      + humidity_bonus
-  )
+      # 실제 매매 버튼 클릭 시 일일 한도 자동 차감
+      if summary["action"] == "BET" and summary["actual_stake"] > 0:
+        if st.button(
+            f"💵 {summary['actual_stake']:,}원 매매 실행 (일일 한도 차감)"
+        ):
+          st.session_state["daily_spent"] += summary["actual_stake"]
+          st.success(
+              f"{summary['actual_stake']:,}원 투입 완료! (오늘 총 사용:"
+              f" {st.session_state['daily_spent']:,}원)"
+          )
+          st.rerun()
 
-  # Softmax 확률 도출
-  exp_s = np.exp(df["score"] - df["score"].max())
-  df["AI_승률(%)"] = ((exp_s / exp_s.sum()) * 100).round(1)
-
-  df["market_raw"] = 1.0 / np.maximum(df["winOdds"], 1.05)
-  df["시장_승률(%)"] = ((df["market_raw"] / df["market_raw"].sum()) * 100).round(
-      1
-  )
-
-  df["AI_EDGE(%p)"] = (df["AI_승률(%)"] - df["시장_승률(%)"]).round(1)
-  df["EV_기대값"] = ((df["AI_승률(%)"] / 100.0) * df["winOdds"]) - 1.0
-  df["AI_예측순위"] = (
-      df["AI_승률(%)"].rank(ascending=False, method="min").astype(int)
-  )
-
-  sorted_df = df.sort_values(by="AI_예측순위").reset_index(drop=True)
-  top1 = sorted_df.iloc[0]
-  top2 = sorted_df.iloc[1] if len(sorted_df) > 1 else top1
-
-  top1_win_rt = top1["AI_승률(%)"]
-  gap = top1_win_rt - top2["AI_승률(%)"]
-  ev = top1["EV_기대값"]
-
-  # 4. 🔥 [현실화된 등급 판정 로직]
-  # 1위 승률이 높거나, 2위와의 격차가 벌어지면 적극적으로 베팅 추천!
-  if top1_win_rt >= 20.0 or gap >= 5.0 or ev >= 0.15:
-    raw_grade, target_stake = "🔥 S급", 5000
-  elif top1_win_rt >= 15.0 or gap >= 3.0 or ev >= 0.0:
-    raw_grade, target_stake = "🔷 A급", 3000
-  elif top1_win_rt >= 12.0 or gap >= 1.5 or ev >= -0.15:
-    raw_grade, target_stake = "📙 B급", 2000
-  else:
-    raw_grade, target_stake = "🔴 C/D급", 0
-
-  # 5. 잔여 예산 검사
-  if target_stake == 0:
-    final_grade, badge_cls, actual_stake, action = (
-        "🔴 PASS (초혼전 경주)",
-        "badge-pass",
-        0,
-        "PASS",
-    )
-  elif rem_budget < target_stake:
-    final_grade, badge_cls, actual_stake, action = (
-        f"🔒 PASS (예산 부족: 남은 예산 {rem_budget:,}원)",
-        "badge-pass",
-        0,
-        "PASS",
-    )
-  else:
-    final_grade = f"{raw_grade} (추천)"
-    badge_cls = (
-        "badge-s"
-        if "S급" in raw_grade
-        else ("badge-a" if "A급" in raw_grade else "badge-b")
-    )
-    actual_stake, action = target_stake, "BET"
-
-  # UI 표 가공
-  display_cols = {
-      "AI_예측순위": "순위",
-      "chulNo": "마번",
-      "hrName": "마명",
-      "jkName": "기수",
-      "trName": "조교사",
-      "handyCap": "부담중량",
-      "winOdds": "단승배당",
-      "AI_승률(%)": "AI 승률",
-      "시장_승률(%)": "시장 승률",
-      "AI_EDGE(%p)": "EDGE(%p)",
-  }
-
-  valid_cols = [c for c in display_cols.keys() if c in sorted_df.columns]
-  ui_df = sorted_df[valid_cols].rename(columns=display_cols)
-
-  if "AI 승률" in ui_df.columns:
-    ui_df["AI 승률"] = ui_df["AI 승률"].astype(str) + "%"
-  if "시장 승률" in ui_df.columns:
-    ui_df["시장 승률"] = ui_df["시장 승률"].astype(str) + "%"
-
-  return (
-      ui_df,
-      water_percent,
-      final_grade,
-      badge_cls,
-      actual_stake,
-      action,
-      gap,
-      rem_budget,
-      top1,
-  )
+      # 하단 핵심 정제표
+      st.subheader(f"📊 {selected_race}경주 핵심 AI 퀀트 정제표")
+      st.dataframe(ui_df, use_container_width=True, hide_index=True)
