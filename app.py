@@ -1,7 +1,7 @@
 import streamlit as st
 # 동일한 디렉토리에 위치한 파이프라인 Class 로드
 from kra_pipeline import KRADataPipeline
-
+from quant_pipeline_test import KRADataPipeline
 # ==========================================
 # 0. UI 기본 레이아웃 및 CSS 설정
 # ==========================================
