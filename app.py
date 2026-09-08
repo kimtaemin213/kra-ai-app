@@ -1,299 +1,9 @@
-import xml.etree.ElementTree as ET
-import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-
-
-# ==========================================
-# 1. KRA 8개 API 수신 및 연산 파이프라인 Class
-# ==========================================
-class KRADataPipeline:
-
-  def __init__(self, service_key):
-    self.service_key = service_key
-    self.endpoints = {
-        "entry_sheet": "https://apis.data.go.kr/B551015/API26_2/entrySheet_2",
-        "track_info": "https://apis.data.go.kr/B551015/API189_1/Track_1",
-        "horse_weight": (
-            "https://apis.data.go.kr/B551015/API25_1/entryHorseWeightInfo_1"
-        ),
-        "jockey_result": (
-            "https://apis.data.go.kr/B551015/jkyresult/getjkyresult"
-        ),
-        "total_record": (
-            "https://apis.data.go.kr/B551015/API27_1/totalRecord_1"
-        ),
-        "race_result": "https://apis.data.go.kr/B551015/API156/raceRsutDtl",
-        "highest_dividend": (
-            "https://apis.data.go.kr/B551015/API35_1/highestDividendRateInfo_1"
-        ),
-        "jeju_result": (
-            "https://apis.data.go.kr/B551015/jejuhorseresult/getjejuhorseresult"
-        ),
-    }
-
-  def fetch_raw_api(self, url, params):
-    full_params = {
-        "ServiceKey": self.service_key,
-        "serviceKey": self.service_key,
-        "pageNo": "1",
-        "numOfRows": "100",
-        "_type": "xml",
-        **params,
-    }
-    try:
-      res = requests.get(url, params=full_params, timeout=6)
-      if res.status_code != 200:
-        return None, f"HTTP {res.status_code}"
-      root = ET.fromstring(res.content)
-      err_msg = root.findtext(".//errMsg") or root.findtext(".//returnAuthMsg")
-      if err_msg:
-        return None, f"게이트웨이 에러: {err_msg}"
-      res_code = root.findtext(".//resultCode")
-      if res_code in ["00", "0", "NORMAL_SERVICE", "OK"]:
-        items = root.findall(".//item")
-        if items:
-          return (
-              pd.DataFrame([
-                  {child.tag: child.text for child in item} for item in items
-              ]),
-              None,
-          )
-        return pd.DataFrame(), "조회 데이터 없음"
-      return None, f"서비스 에러 [{res_code}]"
-    except Exception as e:
-      return None, f"통신 장애: {str(e)}"
-
-  def process_pipeline(
-      self, meet_code, target_date, selected_race, daily_spent
-  ):
-    DAILY_LIMIT = 30000
-    rem_budget = max(0, DAILY_LIMIT - daily_spent)
-
-    # 1. 메인 API (출전표, 주로)
-    df_entry, err = self.fetch_raw_api(
-        self.endpoints["entry_sheet"],
-        {"meet": meet_code, "rc_date": target_date},
-    )
-    df_track, _ = self.fetch_raw_api(
-        self.endpoints["track_info"],
-        {
-            "meet": meet_code,
-            "rc_date_fr": target_date,
-            "rc_date_to": target_date,
-        },
-    )
-
-    if err or df_entry is None or df_entry.empty:
-      return None, err or "출전표 수신 실패", None
-
-    if "rcNo" in df_entry.columns:
-      df_race = df_entry[
-          df_entry["rcNo"].astype(str) == str(selected_race)
-      ].copy()
-    else:
-      df_race = df_entry.copy()
-
-    if df_race.empty:
-      return None, f"{selected_race}경주 출전 데이터가 없습니다.", None
-
-    # 2. 보조 API 병렬 수신
-    df_weight, _ = self.fetch_raw_api(
-        self.endpoints["horse_weight"],
-        {"meet": meet_code, "rc_date": target_date},
-    )
-    df_jockey, _ = self.fetch_raw_api(
-        self.endpoints["jockey_result"], {"meet": meet_code}
-    )
-
-    # 3. 보조 API 맵 산출
-    jockey_win_map = {}
-    if (
-        df_jockey is not None
-        and not df_jockey.empty
-        and "jkName" in df_jockey.columns
-    ):
-      if "winRateyear" in df_jockey.columns:
-        jockey_win_map = dict(
-            zip(
-                df_jockey["jkName"],
-                pd.to_numeric(
-                    df_jockey["winRateyear"].astype(str).str.replace("%", ""),
-                    errors="coerce",
-                ).fillna(0.0),
-            )
-        )
-
-    weight_diff_map, now_weight_map = {}, {}
-    if df_weight is not None and not df_weight.empty:
-      if "chulNo" in df_weight.columns:
-        if "wgHrDiff" in df_weight.columns:
-          weight_diff_map = dict(
-              zip(
-                  df_weight["chulNo"].astype(str),
-                  pd.to_numeric(df_weight["wgHrDiff"], errors="coerce").fillna(
-                      0
-                  ),
-              )
-          )
-        if "wgHr" in df_weight.columns:
-          now_weight_map = dict(
-              zip(
-                  df_weight["chulNo"].astype(str),
-                  pd.to_numeric(df_weight["wgHr"], errors="coerce").fillna(0),
-              )
-          )
-
-    # 주로 정보
-    water_percent = 4.0
-    track_state = "양호"
-    if df_track is not None and not df_track.empty:
-      if "waterPercent" in df_track.columns:
-        try:
-          water_percent = float(df_track.iloc[0].get("waterPercent", 4.0))
-        except ValueError:
-          water_percent = 4.0
-      if "trackState" in df_track.columns:
-        track_state = str(df_track.iloc[0].get("trackState", "양호"))
-
-    # 4. 연산 및 데이터 바인딩
-    scores, jk_win_list, hr_win_list, rating_list = [], [], [], []
-    for idx, row in df_race.iterrows():
-      jk_name = str(row.get("jkName", ""))
-      jk_win_rt = jockey_win_map.get(jk_name, 0.0)
-      jk_win_list.append(jk_win_rt)
-
-      ord1_cnt_y = pd.to_numeric(row.get("ord1CntY", 0), errors="coerce") or 0.0
-      rc_cnt_y = pd.to_numeric(row.get("rcCntY", 1), errors="coerce") or 1.0
-      hr_win_rt = (ord1_cnt_y / max(rc_cnt_y, 1.0)) * 100.0
-      hr_win_list.append(round(hr_win_rt, 1))
-
-      rating = pd.to_numeric(row.get("rating", 0), errors="coerce") or 0.0
-      rating_list.append(rating)
-      rating_score = (rating / 120.0) * 100.0
-
-      handy_cap = (
-          pd.to_numeric(
-              row.get("wgBudam", row.get("handyCap", 0)), errors="coerce"
-          )
-          or 0.0
-      )
-      handy_score = (handy_cap / 60.0) * 100.0
-
-      chul_no = str(row.get("chulNo", ""))
-      wg_diff = weight_diff_map.get(chul_no, 0.0)
-      weight_penalty = -0.3 if abs(wg_diff) >= 10.0 else 0.0
-      humidity_bonus = 0.20 if water_percent >= 10.0 else 0.0
-
-      jk_weight, hr_weight = (
-          (1.20, 1.40) if str(meet_code) == "2" else (1.40, 1.20)
-      )
-
-      total_score = (
-          (jk_win_rt / 20.0) * jk_weight
-          + (hr_win_rt / 25.0) * hr_weight
-          + (rating_score / 80.0) * 1.10
-          - (handy_score / 50.0) * 0.40
-          + weight_penalty
-          + humidity_bonus
-      )
-      scores.append(total_score)
-
-    df_race["raw_score"] = scores
-    df_race["기수_1년승률_val"] = jk_win_list
-    df_race["마필_1년승률_val"] = hr_win_list
-    df_race["레이팅_val"] = rating_list
-
-    exp_s = np.exp(df_race["raw_score"] - df_race["raw_score"].max())
-    df_race["AI_승률_val"] = ((exp_s / exp_s.sum()) * 100).round(1)
-
-    df_race["체중"] = [
-        f"{now_weight_map.get(str(r.get('chulNo')), '-')}kg"
-        for _, r in df_race.iterrows()
-    ]
-    df_race["체중변화"] = [
-        f"{weight_diff_map.get(str(r.get('chulNo')), 0):+d}kg"
-        for _, r in df_race.iterrows()
-    ]
-
-    has_real_odds = False
-    if "winOdds" in df_race.columns:
-      odds_vals = pd.to_numeric(df_race["winOdds"], errors="coerce").fillna(0.0)
-      if not (odds_vals == 0.0).all() and not (odds_vals == 5.0).all():
-        has_real_odds = True
-        df_race["winOdds_val"] = odds_vals
-
-    if has_real_odds:
-      df_race["EV_기대값"] = (
-          (df_race["AI_승률_val"] / 100.0) * df_race["winOdds_val"]
-      ) - 1.0
-      df_race["단승배당"] = df_race["winOdds_val"].apply(lambda x: f"{x:.1f}배")
-    else:
-      df_race["단승배당"] = "대기중"
-      df_race["EV_기대값"] = 0.0
-
-    df_race["AI_예측순위"] = (
-        df_race["AI_승률_val"]
-        .rank(ascending=False, method="min")
-        .astype(int)
-    )
-    sorted_df = df_race.sort_values(by="AI_예측순위").reset_index(drop=True)
-
-    summary_info = {
-        "water_pct": water_percent,
-        "track_state": track_state,
-        "rem_budget": rem_budget,
-        "has_odds": has_real_odds,
-    }
-
-    return sorted_df, None, summary_info
-
-
-# ==========================================
-# 2. UI 및 금/은/동 이모지 생성 함수
-# ==========================================
-def attach_medal_labels(df, val_col):
-  """해당 컬럼의 1, 2, 3등에게 금은동 이모지를 부여하는 함수"""
-  ranks = df[val_col].rank(ascending=False, method="min")
-  formatted_list = []
-  for val, rank in zip(df[val_col], ranks):
-    if rank == 1:
-      formatted_list.append(f"🥇 {val}")
-    elif rank == 2:
-      formatted_list.append(f"🥈 {val}")
-    elif rank == 3:
-      formatted_list.append(f"🥉 {val}")
-    else:
-      formatted_list.append(f"{val}")
-  return formatted_list
-
+from kra_pipeline_v2 import KRAFeatureEngineV2
 
 st.set_page_config(
-    page_title="KRA AI Quant Betting Console", page_icon="🏇", layout="wide"
-)
-
-st.markdown(
-    """
-    <style>
-    .top-card { padding: 16px; border-radius: 12px; font-family: 'Noto Sans KR', sans-serif; }
-    .card-1 { background-color: #FEF9C3; border: 1px solid #FDE047; color: #854D0E; }
-    .card-2 { background-color: #EFF6FF; border: 1px solid #BFDBFE; color: #1E40AF; }
-    .card-3 { background-color: #FFEDD5; border: 1px solid #FED7AA; color: #9A3412; }
-    
-    .card-title { font-weight: bold; font-size: 0.9rem; margin-bottom: 6px; }
-    .card-horse { font-size: 1.3rem; font-weight: 800; margin-bottom: 4px; }
-    .card-sub { font-size: 0.82rem; opacity: 0.85; margin-bottom: 8px; }
-    .card-win { font-size: 1.1rem; font-weight: bold; color: #0284C7; }
-
-    .portfolio-box { background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 12px 18px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
-    .badge-p { padding: 4px 8px; border-radius: 6px; font-weight: bold; font-size: 0.8rem; color: white; margin-right: 8px; }
-    .bg-main { background-color: #0369A1; }
-    .bg-sub { background-color: #0284C7; }
-    .bg-single { background-color: #DB2777; }
-    </style>
-""",
-    unsafe_allow_html=True,
+    page_title="KRA AI Quant System V2", page_icon="🏇", layout="wide"
 )
 
 
@@ -307,123 +17,81 @@ def get_service_key():
     )
 
 
-st.title("🏇 KRA AI 승률 예측 & 퀀트 포트폴리오 콘솔")
+st.title("🏇 KRA AI Quant System V2 (Z-Score & Calibration 적용)")
+st.caption("Bayesian Smoothing | Relative Z-Score | Shannon Entropy Difficulty")
 
-if "daily_spent" not in st.session_state:
-  st.session_state["daily_spent"] = 0
-
-col_a, col_b, col_c = st.columns([2, 2, 1])
-with col_a:
-  target_date = st.text_input("📅 경기 날짜 (YYYYMMDD)", value="20240901")
-with col_b:
+col1, col2, col3 = st.columns([2, 2, 1])
+with col1:
+  target_date = st.text_input("📅 경주 날짜 (YYYYMMDD)", value="20240901")
+with col2:
   meet_choice = st.selectbox(
       "🏟️ 경마장",
       options=["1", "2", "3"],
       format_func=lambda x: {"1": "서울", "2": "제주", "3": "부산경남"}[x],
   )
-with col_c:
+with col3:
   selected_race = st.number_input(
       "🏁 경주 번호", min_value=1, max_value=15, value=1
   )
 
-if st.button("🚀 AI 퀀트 분석 및 시각화 리포트 생성"):
-  pipeline = KRADataPipeline(get_service_key())
-  sorted_df, err, summary = pipeline.process_pipeline(
-      meet_choice, target_date, selected_race, st.session_state["daily_spent"]
+if st.button("🚀 V2 퀀트 분석 엔진 가동"):
+  engine = KRAFeatureEngineV2(get_service_key())
+  df_res, summary, err = engine.build_feature_matrix(
+      meet_choice, target_date, str(selected_race)
   )
 
   if err:
-    st.error(f"데이터 파이프라인 처리 오류: {err}")
+    st.error(f"파이프라인 장애: {err}")
   else:
-    st.info(
-        f"🌧️ **당일 주로 상태**: {summary['track_state']} | 💧 **주로 함수율**: {summary['water_pct']}%"
+    # 1. 경주 난이도 헤더
+    status_color = "green" if summary["bet_recommend"] else "red"
+    st.markdown(
+        f"""
+        <div style="background-color:#1e293b; padding:18px; border-radius:12px; color:white; margin-bottom:15px;">
+            <h3 style="margin:0;">분석 결과: <span style="color:{status_color};">{summary['difficulty_grade']}</span></h3>
+            <p style="margin-top:8px; color:#94a3b8;">
+                🥇 Top1 확률: <b>{summary['top1_prob']}%</b> | 
+                Top1-2 격차: <b>{summary['gap_p']}%p</b> | 
+                불확실성(Entropy): <b>{summary['normalized_entropy']}</b> (1.0에 가까울수록 초혼전) | 
+                주로 함수율: <b>{summary['water_percent']}%</b>
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    top1 = sorted_df.iloc[0]
-    top2 = sorted_df.iloc[1] if len(sorted_df) > 1 else top1
-    top3 = sorted_df.iloc[2] if len(sorted_df) > 2 else top2
-
-    # 섹션 1: 👑 AI 순수 예측 TOP 3 카드리포트
-    st.subheader("👑 AI 순수 예측 TOP 3")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-      st.markdown(
-          f"""
-            <div class="top-card card-1">
-                <div class="card-title">🥇 1위 예측</div>
-                <div class="card-horse">{top1.get('chulNo')}번 {top1.get('hrName')}</div>
-                <div class="card-sub">기수: {top1.get('jkName')} | 부담중량: {top1.get('wgBudam', top1.get('handyCap', '-'))}kg</div>
-                <div class="card-win">AI 승률: {top1.get('AI_승률_val')}%</div>
-                <div style="font-size:0.8rem; color:#A16207;">(단승 배당: {top1.get('단승배당')})</div>
-            </div>
-            """,
-          unsafe_allow_html=True,
+    if not summary["bet_recommend"]:
+      st.warning(
+          "🔒 [PASS 권장] 경주 난이도가 너무 높거나(C급 초혼전) AI 승률 상위마 간"
+          " 격차가 적어 매매를 건너뜁니다."
       )
 
-    with c2:
-      st.markdown(
-          f"""
-            <div class="top-card card-2">
-                <div class="card-title">🥈 2위 예측</div>
-                <div class="card-horse">{top2.get('chulNo')}번 {top2.get('hrName')}</div>
-                <div class="card-sub">기수: {top2.get('jkName')} | 부담중량: {top2.get('wgBudam', top2.get('handyCap', '-'))}kg</div>
-                <div class="card-win">AI 승률: {top2.get('AI_승률_val')}%</div>
-                <div style="font-size:0.8rem; color:#1D4ED8;">(단승 배당: {top2.get('단승배당')})</div>
-            </div>
-            """,
-          unsafe_allow_html=True,
-      )
-
-    with c3:
-      st.markdown(
-          f"""
-            <div class="top-card card-3">
-                <div class="card-title">🥉 3위 예측</div>
-                <div class="card-horse">{top3.get('chulNo')}번 {top3.get('hrName')}</div>
-                <div class="card-sub">기수: {top3.get('jkName')} | 부담중량: {top3.get('wgBudam', top3.get('handyCap', '-'))}kg</div>
-                <div class="card-win">AI 승률: {top3.get('AI_승률_val')}%</div>
-                <div style="font-size:0.8rem; color:#C2410C;">(단승 배당: {top3.get('단승배당')})</div>
-            </div>
-            """,
-          unsafe_allow_html=True,
-      )
-
-    st.write("")
-
-    # 섹션 2: 📊 출전마 AI 순수 승률 & 통합 퀀트 분석표
-    st.subheader("📊 출전마 AI 순수 승률 & 통합 퀀트 분석표")
-
-    # 각 주요 지표별 🥇 🥈 🥉 금은동 메달 부착
-    rating_medals = attach_medal_labels(sorted_df, "레이팅_val")
-    jk_win_medals = [
-        f"{val}%"
-        for val in attach_medal_labels(sorted_df, "기수_1년승률_val")
-    ]
-    hr_win_medals = [
-        f"{val}%"
-        for val in attach_medal_labels(sorted_df, "마필_1년승률_val")
-    ]
-    ai_rank_medals = attach_medal_labels(sorted_df, "AI_예측순위")
+    # 2. 메인 퀀트 테이블 표출
+    st.subheader("📊 V2 피처 융합 및 AI 승률 데이터프레임")
 
     display_df = pd.DataFrame({
-        "AI순위": ai_rank_medals,
-        "게이트": sorted_df["chulNo"],
-        "마명": sorted_df["hrName"],
-        "기수명": sorted_df["jkName"],
-        "부담중량": sorted_df.get(
-            "wgBudam", sorted_df.get("handyCap", "-")
+        "AI 순위": df_res["AI_예측순위"],
+        "마번": df_res["chulNo"],
+        "마명": df_res["hrName"],
+        "기수": df_res["jkName"],
+        "평활화 마필승률": df_res["feat_hr_smoothed_win"].apply(
+            lambda x: f"{x*100:.1f}%"
         ),
-        "레이팅": rating_medals,
-        "기수 1년승률": jk_win_medals,
-        "마필 1년승률": hr_win_medals,
-        "AI 승률(%)": sorted_df["AI_승률_val"],
-        "단승배당": sorted_df["단승배당"],
-        "EV (기대값)": sorted_df["EV_기대값"].apply(lambda x: f"{x:+.2f}"),
-        "체중": sorted_df["체중"],
-        "체중변화": sorted_df["체중변화"],
+        "기수 1년성적": df_res["feat_jk_score"].apply(
+            lambda x: f"{x*100:.1f}%"
+        ),
+        "부담중량 상대Z": df_res["feat_budam_z"].apply(
+            lambda x: f"{x:+.2f}σ"
+        ),
+        "레이팅 상대Z": df_res["feat_rating_z"].apply(
+            lambda x: f"{x:+.2f}σ"
+        ),
+        "체중 감점": df_res["feat_weight_penalty"].apply(
+            lambda x: f"{x:.2f}"
+        ),
+        "AI 승률(%)": df_res["AI_승률(%)"],
     })
 
-    # 막대 그래프(Progress Bar)를 포함한 표출
     st.dataframe(
         display_df,
         column_config={
@@ -431,48 +99,9 @@ if st.button("🚀 AI 퀀트 분석 및 시각화 리포트 생성"):
                 "AI 승률(%)",
                 format="%.1f%%",
                 min_value=0,
-                max_value=float(sorted_df["AI_승률_val"].max() * 1.2),
+                max_value=float(df_res["AI_승률(%)"].max() * 1.2),
             ),
         },
         use_container_width=True,
         hide_index=True,
-    )
-
-    st.write("")
-
-    # 섹션 3: 🏇 AI 추천 실전 베팅 포트폴리오
-    st.subheader("🏇 AI 추천 실전 베팅 포트폴리오")
-    total_bet_budget = min(summary["rem_budget"], 10000)
-
-    main_stake = int(total_bet_budget * 0.50)
-    sub1_stake = int(total_bet_budget * 0.20)
-    single_stake = int(total_bet_budget * 0.15)
-
-    st.markdown(
-        f"""
-        <div class="portfolio-box">
-            <div>
-                <span class="badge-p bg-main">복승식 (메인)</span> <b>{top1.get('chulNo')}번 ({top1.get('hrName')}) - {top2.get('chulNo')}번 ({top2.get('hrName')})</b>
-                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">AI 승률 1위({top1.get('AI_승률_val')}%) & 2위({top2.get('AI_승률_val')}%) 축 조합</div>
-            </div>
-            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{main_stake:,}원 (50%)</div>
-        </div>
-
-        <div class="portfolio-box">
-            <div>
-                <span class="badge-p bg-sub">삼복승식 (서브)</span> <b>{top1.get('chulNo')} - {top2.get('chulNo')} - {top3.get('chulNo')}번 ({top3.get('hrName')})</b>
-                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">1-2위 고정 후 3착 복병({top3.get('hrName')}) 삼복승 방어</div>
-            </div>
-            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{sub1_stake:,}원 (20%)</div>
-        </div>
-
-        <div class="portfolio-box">
-            <div>
-                <span class="badge-p bg-single">단승식 (가치베팅)</span> <b>{top1.get('chulNo')}번 ({top1.get('hrName')})</b>
-                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">AI 최상위 1위 단독 베팅</div>
-            </div>
-            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{single_stake:,}원 (15%)</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
     )
