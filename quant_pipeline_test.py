@@ -35,8 +35,7 @@ class KRAFeatureEngineV2:
         **params,
     }
     try:
-      # timeout을 4초로 단축하여 무한 멈춤 방지
-      res = requests.get(url, params=full_params, timeout=4)
+      res = requests.get(url, params=full_params, timeout=5)
       if res.status_code != 200:
         return None, f"HTTP {res.status_code}"
 
@@ -58,7 +57,7 @@ class KRAFeatureEngineV2:
         return pd.DataFrame(), "데이터 없음"
       return None, f"서비스 에러 [{res_code}]"
     except Exception as e:
-      return None, f"통신 장애/초과: {str(e)}"
+      return None, f"통신 장애: {str(e)}"
 
   @staticmethod
   def bayesian_smoothed_win_rate(
@@ -234,7 +233,10 @@ class KRAFeatureEngineV2:
         + (jockey_qu_y_map.get(str(r.get("jkName", "")), 0.0) * 0.3)
         for _, r in df.iterrows()
     ]
+
+    # 💡 [핵심 수정]: 무거울수록 마이너스(-), 가벼울수록 플러스(+)가 되도록 Z-Score 부호 정정
     df["feat_budam_z"] = -1.0 * self.compute_z_score(df["budam_num"])
+
     df["feat_rating_z"] = self.compute_z_score(df["rating_num"])
     df["feat_weight_penalty"] = [
         self.gaussian_weight_penalty(
@@ -246,6 +248,7 @@ class KRAFeatureEngineV2:
         0.25 * df["feat_rating_z"] if water_percent >= 10.0 else 0.0
     )
 
+    # 💡 [핵심 수정]: feat_budam_z가 이미 부호 정정되었으므로 그대로 (+) 더함
     df["composite_logits"] = (
         (df["feat_hr_smoothed_win"] * 2.0)
         + (df["feat_jk_score"] * 1.8)
