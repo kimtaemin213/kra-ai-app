@@ -1,278 +1,248 @@
-import math
-import xml.etree.ElementTree as ET
-import numpy as np
 import pandas as pd
-import requests
+import streamlit as st
+
+st.set_page_config(
+    page_title="KRA AI Quant Betting Console V2", page_icon="🏇", layout="wide"
+)
 
 
-class KRAFeatureEngineV2:
-  """KRA AI Quant Feature Engineering & Probability Calibration Engine V2"""
+def attach_medal_labels(df, val_col):
+  ranks = df[val_col].rank(ascending=False, method="min")
+  formatted_list = []
+  for val, rank in zip(df[val_col], ranks):
+    if rank == 1:
+      formatted_list.append(f"🥇 {val}")
+    elif rank == 2:
+      formatted_list.append(f"🥈 {val}")
+    elif rank == 3:
+      formatted_list.append(f"🥉 {val}")
+    else:
+      formatted_list.append(f"{val}")
+  return formatted_list
 
-  def __init__(self, service_key: str):
-    self.service_key = service_key
-    self.endpoints = {
-        "entry_sheet": "https://apis.data.go.kr/B551015/API26_2/entrySheet_2",
-        "track_info": "https://apis.data.go.kr/B551015/API189_1/Track_1",
-        "horse_weight": (
-            "https://apis.data.go.kr/B551015/API25_1/entryHorseWeightInfo_1"
-        ),
-        "jockey_result": (
-            "https://apis.data.go.kr/B551015/jkyresult/getjkyresult"
-        ),
-        "total_record": (
-            "https://apis.data.go.kr/B551015/API27_1/totalRecord_1"
-        ),
-        "race_result": "https://apis.data.go.kr/B551015/API156/raceRsutDtl",
-    }
 
-  def fetch_raw_api(self, url: str, params: dict) -> tuple:
-    full_params = {
-        "ServiceKey": self.service_key,
-        "serviceKey": self.service_key,
-        "pageNo": "1",
-        "numOfRows": "100",
-        "_type": "xml",
-        **params,
-    }
+st.markdown(
+    """
+    <style>
+    .top-card { padding: 16px; border-radius: 12px; font-family: 'Noto Sans KR', sans-serif; }
+    .card-1 { background-color: #FEF9C3; border: 1px solid #FDE047; color: #854D0E; }
+    .card-2 { background-color: #EFF6FF; border: 1px solid #BFDBFE; color: #1E40AF; }
+    .card-3 { background-color: #FFEDD5; border: 1px solid #FED7AA; color: #9A3412; }
+    
+    .card-title { font-weight: bold; font-size: 0.9rem; margin-bottom: 6px; }
+    .card-horse { font-size: 1.3rem; font-weight: 800; margin-bottom: 4px; }
+    .card-sub { font-size: 0.82rem; opacity: 0.85; margin-bottom: 8px; }
+    .card-win { font-size: 1.1rem; font-weight: bold; color: #0284C7; }
+
+    .portfolio-box { background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 12px 18px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    .badge-p { padding: 4px 8px; border-radius: 6px; font-weight: bold; font-size: 0.8rem; color: white; margin-right: 8px; }
+    .bg-main { background-color: #0369A1; }
+    .bg-sub { background-color: #0284C7; }
+    .bg-single { background-color: #DB2777; }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def get_service_key():
+  try:
+    return st.secrets["KRA_SERVICE_KEY"]
+  except Exception:
+    return st.session_state.get(
+        "custom_service_key",
+        "92ac0b865a4117f6158886b90c8ad86908d7d67bead9c9166eb0fef68cddd2da",
+    )
+
+
+st.title("🏇 KRA AI 승률 예측 & 퀀트 포트폴리오 콘솔 V2")
+st.caption("Feature Engine V2: Bayesian Smoothing | Relative Z-Score | Shannon Entropy Difficulty")
+
+if "daily_spent" not in st.session_state:
+  st.session_state["daily_spent"] = 0
+
+col_a, col_b, col_c = st.columns([2, 2, 1])
+with col_a:
+  target_date = st.text_input("📅 경기 날짜 (YYYYMMDD)", value="20240901")
+with col_b:
+  meet_choice = st.selectbox(
+      "🏟️ 경마장",
+      options=["1", "2", "3"],
+      format_func=lambda x: {"1": "서울", "2": "제주", "3": "부산경남"}[x],
+  )
+with col_c:
+  selected_race = st.number_input(
+      "🏁 경주 번호", min_value=1, max_value=15, value=1
+  )
+
+if st.button("🚀 V2 AI 퀀트 분석 및 시각화 리포트 생성"):
+  with st.spinner("KRA 8개 API 다단계 수신 및 V2 퀀트 분석 중..."):
     try:
-      res = requests.get(url, params=full_params, timeout=6)
-      if res.status_code != 200:
-        return None, f"HTTP {res.status_code}"
+      from quant_pipeline_test import KRAFeatureEngineV2
 
-      root = ET.fromstring(res.content)
-      err_msg = root.findtext(".//errMsg") or root.findtext(".//returnAuthMsg")
-      if err_msg:
-        return None, f"API 인증 오류: {err_msg}"
+      engine = KRAFeatureEngineV2(get_service_key())
+      sorted_df, summary, err = engine.build_feature_matrix(
+          meet_choice, target_date, str(selected_race)
+      )
+    except Exception as ex:
+      sorted_df, summary, err = None, None, f"엔진 실행 예외: {str(ex)}"
 
-      res_code = root.findtext(".//resultCode")
-      if res_code in ["00", "0", "NORMAL_SERVICE", "OK"]:
-        items = root.findall(".//item")
-        if items:
-          return (
-              pd.DataFrame([
-                  {child.tag: child.text for child in item} for item in items
-              ]),
-              None,
-          )
-        return pd.DataFrame(), "데이터 없음"
-      return None, f"서비스 에러 [{res_code}]"
-    except Exception as e:
-      return None, f"통신 장애: {str(e)}"
-
-  @staticmethod
-  def bayesian_smoothed_win_rate(
-      win_cnt: float, total_cnt: float, field_mean: float, m_confidence: float = 12.0
-  ) -> float:
-    if total_cnt <= 0:
-      return field_mean
-    return (win_cnt + m_confidence * field_mean) / (total_cnt + m_confidence)
-
-  @staticmethod
-  def compute_z_score(series: pd.Series) -> pd.Series:
-    std = series.std(ddof=0)
-    if pd.isna(std) or std < 1e-6:
-      return pd.Series(0.0, index=series.index)
-    return (series - series.mean()) / std
-
-  @staticmethod
-  def gaussian_weight_penalty(diff_weight: float) -> float:
-    sigma = 6.0
-    penalty = 1.0 - math.exp(-((diff_weight / sigma) ** 2) / 2.0)
-    return -float(penalty) * 0.5
-
-  @staticmethod
-  def calculate_race_difficulty(probs: np.ndarray) -> tuple:
-    probs = np.clip(probs, 1e-12, 1.0)
-    probs = probs / probs.sum()
-
-    sorted_p = np.sort(probs)[::-1]
-    top1_p = sorted_p[0]
-    top2_p = sorted_p[1] if len(sorted_p) > 1 else 0.0
-    gap = top1_p - top2_p
-
-    entropy = -np.sum(probs * np.log2(probs))
-    max_entropy = np.log2(len(probs))
-    norm_entropy = entropy / max_entropy if max_entropy > 0 else 1.0
-
-    if top1_p >= 0.25 and gap >= 0.07 and norm_entropy <= 0.85:
-      difficulty_grade = "🟢 A급 (명확한 축마)"
-      bet_recommend = True
-    elif top1_p >= 0.18 and gap >= 0.03:
-      difficulty_grade = "🟡 B급 (중혼전 - 엄격 선택)"
-      bet_recommend = True
-    else:
-      difficulty_grade = "🔴 C급 (초혼전 / PASS 권장)"
-      bet_recommend = False
-
-    return difficulty_grade, bet_recommend, top1_p, gap, norm_entropy
-
-  def build_feature_matrix(
-      self,
-      meet_code: str,
-      target_date: str,
-      selected_race: str,
-      temperature: float = 1.5,
-  ):
-    df_entry, err = self.fetch_raw_api(
-        self.endpoints["entry_sheet"],
-        {"meet": meet_code, "rc_date": target_date},
+  if err or not isinstance(summary, dict) or sorted_df is None:
+    st.error(f"파이프라인 처리 오류: {err or '데이터 수신 실패'}")
+  else:
+    status_color = "#22c55e" if summary.get("bet_recommend", False) else "#ef4444"
+    st.markdown(
+        f"""
+        <div style="background-color:#1e293b; padding:18px; border-radius:12px; color:white; margin-bottom:15px;">
+            <h3 style="margin:0;">경주 난이도 판독: <span style="color:{status_color};">{summary.get('difficulty_grade', 'N/A')}</span></h3>
+            <p style="margin-top:8px; color:#94a3b8; font-size:0.95rem;">
+                🥇 Top1 확률: <b>{summary.get('top1_prob', 0)}%</b> | 
+                Top1-2 승률 격차: <b>{summary.get('gap_p', 0)}%p</b> | 
+                불확실성(Entropy): <b>{summary.get('normalized_entropy', 0)}</b> (1.0에 가까울수록 초혼전) | 
+                💧 주로 함수율: <b>{summary.get('water_percent', 0)}%</b>
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    if err or df_entry is None or df_entry.empty:
-      return None, None, err or "출전표 데이터 없음"
 
-    if "rcNo" in df_entry.columns:
-      df = df_entry[df_entry["rcNo"].astype(str) == str(selected_race)].copy()
-    else:
-      df = df_entry.copy()
+    if not summary.get("bet_recommend", False):
+      st.warning(
+          "🔒 [PASS 권장] 경주 난이도가 너무 높거나(C급 초혼전) AI 승률 상위마 간"
+          " 격차가 적어 위험도가 높습니다."
+      )
 
-    if df.empty:
-      return None, None, f"{selected_race}경주 데이터를 찾을 수 없습니다."
+    top1 = sorted_df.iloc[0]
+    top2 = sorted_df.iloc[1] if len(sorted_df) > 1 else top1
+    top3 = sorted_df.iloc[2] if len(sorted_df) > 2 else top2
 
-    df_track, _ = self.fetch_raw_api(
-        self.endpoints["track_info"],
-        {
-            "meet": meet_code,
-            "rc_date_fr": target_date,
-            "rc_date_to": target_date,
+    st.subheader("👑 AI 순수 예측 TOP 3")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+      st.markdown(
+          f"""
+            <div class="top-card card-1">
+                <div class="card-title">🥇 1위 예측</div>
+                <div class="card-horse">{top1.get('chulNo')}번 {top1.get('hrName')}</div>
+                <div class="card-sub">기수: {top1.get('jkName')} | 부담중량: {top1.get('budam_num', '-')}kg</div>
+                <div class="card-win">AI 승률: {top1.get('AI_승률(%)')}%</div>
+            </div>
+            """,
+          unsafe_allow_html=True,
+      )
+
+    with c2:
+      st.markdown(
+          f"""
+            <div class="top-card card-2">
+                <div class="card-title">🥈 2위 예측</div>
+                <div class="card-horse">{top2.get('chulNo')}번 {top2.get('hrName')}</div>
+                <div class="card-sub">기수: {top2.get('jkName')} | 부담중량: {top2.get('budam_num', '-')}kg</div>
+                <div class="card-win">AI 승률: {top2.get('AI_승률(%)')}%</div>
+            </div>
+            """,
+          unsafe_allow_html=True,
+      )
+
+    with c3:
+      st.markdown(
+          f"""
+            <div class="top-card card-3">
+                <div class="card-title">🥉 3위 예측</div>
+                <div class="card-horse">{top3.get('chulNo')}번 {top3.get('hrName')}</div>
+                <div class="card-sub">기수: {top3.get('jkName')} | 부담중량: {top3.get('budam_num', '-')}kg</div>
+                <div class="card-win">AI 승률: {top3.get('AI_승률(%)')}%</div>
+            </div>
+            """,
+          unsafe_allow_html=True,
+      )
+
+    st.write("")
+
+    st.subheader("📊 출전마 AI 순수 승률 & V2 퀀트 분석표")
+
+    sorted_df["smoothed_win_pct"] = (
+        sorted_df["feat_hr_smoothed_win"] * 100
+    ).round(1)
+    sorted_df["jk_score_pct"] = (sorted_df["feat_jk_score"] * 100).round(1)
+
+    hr_win_medals = [
+        f"{val}%"
+        for val in attach_medal_labels(sorted_df, "smoothed_win_pct")
+    ]
+    jk_win_medals = [
+        f"{val}%" for val in attach_medal_labels(sorted_df, "jk_score_pct")
+    ]
+    rating_medals = attach_medal_labels(sorted_df, "rating_num")
+    ai_rank_medals = attach_medal_labels(sorted_df, "AI_예측순위")
+
+    display_df = pd.DataFrame({
+        "AI 순위": ai_rank_medals,
+        "게이트": sorted_df["chulNo"],
+        "마명": sorted_df["hrName"],
+        "기수": sorted_df["jkName"],
+        "부담중량": sorted_df["budam_num"],
+        "레이팅": rating_medals,
+        "평활화 마필승률": hr_win_medals,
+        "기수 1년성적": jk_win_medals,
+        "부담 상대Z": sorted_df["feat_budam_z"].apply(
+            lambda x: f"{x:+.2f}σ"
+        ),
+        "체중 감점": sorted_df["feat_weight_penalty"].apply(
+            lambda x: f"{x:.2f}"
+        ),
+        "AI 승률(%)": sorted_df["AI_승률(%)"],
+    })
+
+    st.dataframe(
+        display_df,
+        column_config={
+            "AI 승률(%)": st.column_config.ProgressColumn(
+                "AI 승률(%)",
+                format="%.1f%%",
+                min_value=0,
+                max_value=float(sorted_df["AI_승률(%)"].max() * 1.2),
+            ),
         },
-    )
-    df_weight, _ = self.fetch_raw_api(
-        self.endpoints["horse_weight"],
-        {"meet": meet_code, "rc_date": target_date},
-    )
-    df_jockey, _ = self.fetch_raw_api(
-        self.endpoints["jockey_result"], {"meet": meet_code}
+        use_container_width=True,
+        hide_index=True,
     )
 
-    jockey_win_y_map, jockey_qu_y_map = {}, {}
-    if (
-        df_jockey is not None
-        and not df_jockey.empty
-        and "jkName" in df_jockey.columns
-    ):
-      if "winRateyear" in df_jockey.columns:
-        jockey_win_y_map = dict(
-            zip(
-                df_jockey["jkName"],
-                pd.to_numeric(
-                    df_jockey["winRateyear"].astype(str).str.replace("%", ""),
-                    errors="coerce",
-                ).fillna(0.0)
-                / 100.0,
-            )
-        )
-      if "quRateyear" in df_jockey.columns:
-        jockey_qu_y_map = dict(
-            zip(
-                df_jockey["jkName"],
-                pd.to_numeric(
-                    df_jockey["quRateyear"].astype(str).str.replace("%", ""),
-                    errors="coerce",
-                ).fillna(0.0)
-                / 100.0,
-            )
-        )
+    st.write("")
 
-    weight_diff_map = {}
-    if (
-        df_weight is not None
-        and not df_weight.empty
-        and "chulNo" in df_weight.columns
-    ):
-      if "wgHrDiff" in df_weight.columns:
-        weight_diff_map = dict(
-            zip(
-                df_weight["chulNo"].astype(str),
-                pd.to_numeric(df_weight["wgHrDiff"], errors="coerce").fillna(
-                    0.0
-                ),
-            )
-        )
+    st.subheader("🏇 AI 추천 실전 베팅 포트폴리오")
+    rem_budget = max(0, 30000 - st.session_state["daily_spent"])
+    total_bet_budget = min(rem_budget, 10000)
 
-    water_percent = 4.0
-    if (
-        df_track is not None
-        and not df_track.empty
-        and "waterPercent" in df_track.columns
-    ):
-      try:
-        water_percent = float(df_track.iloc[0].get("waterPercent", 4.0))
-      except ValueError:
-        water_percent = 4.0
+    main_stake = int(total_bet_budget * 0.50)
+    sub1_stake = int(total_bet_budget * 0.20)
+    single_stake = int(total_bet_budget * 0.15)
 
-    df["ord1CntY"] = pd.to_numeric(df.get("ord1CntY", 0), errors="coerce").fillna(
-        0.0
+    st.markdown(
+        f"""
+        <div class="portfolio-box">
+            <div>
+                <span class="badge-p bg-main">복승식 (메인)</span> <b>{top1.get('chulNo')}번 ({top1.get('hrName')}) - {top2.get('chulNo')}번 ({top2.get('hrName')})</b>
+                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">AI 승률 1위({top1.get('AI_승률(%)')}%) & 2위({top2.get('AI_승률(%)')}%) 메인 축 조합</div>
+            </div>
+            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{main_stake:,}원 (50%)</div>
+        </div>
+
+        <div class="portfolio-box">
+            <div>
+                <span class="badge-p bg-sub">삼복승식 (서브)</span> <b>{top1.get('chulNo')} - {top2.get('chulNo')} - {top3.get('chulNo')}번 ({top3.get('hrName')})</b>
+                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">1-2위 고정 후 3착 복병({top3.get('hrName')}) 삼복승 방어</div>
+            </div>
+            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{sub1_stake:,}원 (20%)</div>
+        </div>
+
+        <div class="portfolio-box">
+            <div>
+                <span class="badge-p bg-single">단승식 (가치베팅)</span> <b>{top1.get('chulNo')}번 ({top1.get('hrName')})</b>
+                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">AI 최상위 1위 단독 베팅</div>
+            </div>
+            <div style="font-weight:bold; font-size:1.05rem; color:#0F172A;">{single_stake:,}원 (15%)</div>
+        </div>
+    """,
+        unsafe_allow_html=True,
     )
-    df["rcCntY"] = pd.to_numeric(df.get("rcCntY", 0), errors="coerce").fillna(
-        0.0
-    )
-    df["rating_num"] = pd.to_numeric(df.get("rating", 0), errors="coerce").fillna(
-        0.0
-    )
-    df["budam_num"] = pd.to_numeric(
-        df.get("wgBudam", df.get("handyCap", 0)), errors="coerce"
-    ).fillna(0.0)
-
-    field_mean_hr_win = (
-        df["ord1CntY"].sum() / max(df["rcCntY"].sum(), 1.0)
-        if df["rcCntY"].sum() > 0
-        else 0.10
-    )
-
-    df["feat_hr_smoothed_win"] = [
-        self.bayesian_smoothed_win_rate(
-            r["ord1CntY"], r["rcCntY"], field_mean_hr_win, m_confidence=12.0
-        )
-        for _, r in df.iterrows()
-    ]
-    df["feat_jk_score"] = [
-        (jockey_win_y_map.get(str(r.get("jkName", "")), 0.0) * 0.7)
-        + (jockey_qu_y_map.get(str(r.get("jkName", "")), 0.0) * 0.3)
-        for _, r in df.iterrows()
-    ]
-    df["feat_budam_z"] = -1.0 * self.compute_z_score(df["budam_num"])
-    df["feat_rating_z"] = self.compute_z_score(df["rating_num"])
-    df["feat_weight_penalty"] = [
-        self.gaussian_weight_penalty(
-            weight_diff_map.get(str(r.get("chulNo", "")), 0.0)
-        )
-        for _, r in df.iterrows()
-    ]
-    df["feat_track_interaction"] = (
-        0.25 * df["feat_rating_z"] if water_percent >= 10.0 else 0.0
-    )
-
-    df["composite_logits"] = (
-        (df["feat_hr_smoothed_win"] * 2.0)
-        + (df["feat_jk_score"] * 1.8)
-        + (df["feat_rating_z"] * 0.8)
-        + (df["feat_budam_z"] * 0.5)
-        + df["feat_weight_penalty"]
-        + df["feat_track_interaction"]
-    )
-
-    scaled_logits = df["composite_logits"] / temperature
-    exp_logits = np.exp(scaled_logits - scaled_logits.max())
-    df["AI_prob"] = exp_logits / exp_logits.sum()
-    df["AI_승률(%)"] = (df["AI_prob"] * 100).round(1)
-
-    df["AI_예측순위"] = (
-        df["AI_prob"].rank(ascending=False, method="min").astype(int)
-    )
-    sorted_df = df.sort_values(by="AI_예측순위").reset_index(drop=True)
-
-    grade, bet_rec, top1_p, gap, entropy = self.calculate_race_difficulty(
-        sorted_df["AI_prob"].values
-    )
-
-    metrics_summary = {
-        "difficulty_grade": grade,
-        "bet_recommend": bool(bet_rec),
-        "top1_prob": float(round(top1_p * 100, 1)),
-        "gap_p": float(round(gap * 100, 1)),
-        "normalized_entropy": float(round(entropy, 3)),
-        "water_percent": float(water_percent),
-        "total_horses": int(len(sorted_df)),
-    }
-
-    return sorted_df, metrics_summary, None
